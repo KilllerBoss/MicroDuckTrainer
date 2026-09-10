@@ -170,3 +170,38 @@ Work Log:
 Stage Summary:
 - v2.6 = v2.5 + ehrliche Bestrafung + NaN-feste Rollouts + natürliche G1-Arme
 - APK: download/MicroDuckTrainer-v2.6.apk (39,7 MB), Release v2.6.0
+
+---
+Task ID: v2.7
+Agent: Super Z (Main)
+Task: v2.7 — Gruppen-Training (sichtbare ES-Population) + Vorschau-Cap 16× + APK/Release
+
+Work Log:
+- Nutzerfragen beantwortet: (a) Test = Echtzeit 1×, Training = sichtbare Vorschau adaptiv
+  (vorher cap 6×) + Population headless im Worker; (b) Reward-Reset je Runde + Selektion
+  war bereits exakt so implementiert (ctx.sum=0 in resetCtx, Rank-Update, bestEver);
+  (c) „mehrere gleichzeitig“ = ES-Population 24–96 war nur unsichtbar seriell → jetzt sichtbar
+- rig.ts: syncDuck/syncG1 auf syncDuckRig/syncG1Rig umgestellt (Rig-parametrisiert);
+  NEU cloneDuckRig/cloneG1Rig (deep-clone, Geometrien geteilt, Namens-Maps per Traversal)
+- app-core.ts: GhostCtx + 2 sichtbare Kandidaten (±1σ antithetisch um trainer.theta), eigene
+  MjData je Kandidat, MlpPolicy je Generation neu gezogen, EMA-Glättung wie Held/Training,
+  Zufalls-cmd je Runde (Anfahr-Boden 0.24), Reset bei Sturz/Rundenende, eigener Imitations-
+  Phase-Takt, Datenkontext sauber gesichert/restored (finally), disposeGhosts im loadModel,
+  setGroupShow (persist mdt_v2_group), Auto-Pause (60 Iterationen > 1.15× Budget bei 1× →
+  Einmal-Toast), ghostPaused-Reset in startTraining
+- controlLoop: Vorschau-Cap 6× → 16× (adaptiv unverändert); Badge zeigt JETZT previewSpeed
+  (echtes Tempo) statt Slider-Wert
+- TrainingPanel: Gruppen-Training-Sektion (Violett, Switch + Status „N Roboter"/„Pausiert"),
+  Texte/Caps aktualisiert; TrainerApp: onGroupShow verdrahtet
+- QA (agent-browser, beide Modelle): Ente — 3 Roboter sichtbar, Gen 2, 2 Ghosts/2 Rigs,
+  REWARD 304.9 endlich, „⏩ Welt: 4× sync“; G1 — 3 Roboter aufrecht mit natürlichen Armen,
+  2 Ghosts, Welt 2× sync, keine Seitenfehler (upload/qa_v27_group.png, qa_v27_group_g1.png)
+- APK v2.7 (versionCode 9) gebaut + signiert (gleiche Signatur wie v2.x)
+- GitHub: commit a745277 → main, Release v2.7.0 + APK (39.7 MB)
+
+Stage Summary:
+- v2.7 macht die ES-Population SICHTBAR: 3 Roboter trainieren gleichzeitig (Held = bestTheta,
+  2 Kandidaten = ±σ-Exploration mit Reset-Zyklen wie im echten Training) — die direkte
+  Antwort auf „Sollten nicht mehrere auf einmal trainieren?“
+- Welt-Tempo jetzt ehrlich: Badge zeigt erreichten Sync-Faktor, Cap 16× für starke Geräte
+- Download: https://github.com/KilllerBoss/MicroDuckTrainer/releases/download/v2.7.0/MicroDuckTrainer-v2.7.apk
