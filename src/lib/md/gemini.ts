@@ -9,6 +9,11 @@ import { getModel } from "./models";
 import { REWARD_TERMS, type RewardConfig } from "./rewards";
 import type { WorldFeatures } from "./worldgen";
 
+/** Standard-Key (vom Nutzer bereitgestellt); kann in der UI überschrieben werden. */
+export const DEFAULT_GEMINI_KEY = "AIzaSyCl2mYBoobRRIneTUdJa2FFIF-BGj4iqrg";
+
+export type GeminiPointMode = "aus" | "frei" | "umkreis" | "pfad";
+
 export const GEMINI_MODELS = [
   { id: "gemini-robotics-er-2-preview", label: "Robotics ER 2 (Preview)" },
   { id: "gemini-3.5-flash-lite", label: "3.5 Flash Lite (schnell)" },
@@ -23,6 +28,13 @@ export interface GeminiPatch {
     { enabled?: boolean; weight?: number; param?: number }
   >;
   pointMode?: boolean;
+  point?: {
+    mode?: GeminiPointMode;
+    radius?: number;
+    speedByDist?: boolean;
+    maxSpeed?: number;
+    fullDist?: number;
+  };
   world?: {
     enabled?: boolean;
     difficulty?: number;
@@ -40,7 +52,9 @@ export interface GeminiContext {
   imitationActive: boolean;
   imitationName: string | null;
   worldEnabled: boolean;
-  pointMode: boolean;
+  /** "aus" | "frei" | "umkreis" | "pfad" */
+  pointMode: string;
+  pointRadius: number;
   generation: number;
 }
 
@@ -61,7 +75,11 @@ Roboter: ${meta.label} mit ${meta.actionDim} Gelenken (Positionsaktuatoren, Poli
 Aktive Reward-Terme: ${cur || "keine"}
 Training: ${ctx.generation} Generationen bisher. Imitation einer GLB-Animation aktiv: ${ctx.imitationActive ? `ja (${ctx.imitationName})` : "nein"}.
 Random-Welt (Treppen/Hügel/Löcher/Hindernisse/Balancierstange) aktiv: ${ctx.worldEnabled ? "ja" : "nein"}.
-Punkt-Modus (Joystick bewegt 3D-Punkt, Roboter reagiert per Reward): ${ctx.pointMode ? "ja" : "nein"}.
+Punkt-Modus (Joystick bewegt einen 3D-Punkt, kamera-relativ): aktuell "${ctx.pointMode}" mit Radius ${ctx.pointRadius.toFixed(1)} m.
+  - "aus": kein Punkt (klassische Joystick-Steuerung)
+  - "frei": Punkt frei in der Arena, Roboter verfolgt ihn
+  - "umkreis": Punkt bleibt im Radius um den Roboter
+  - "pfad": Roboter folgt einem physikalisch berechneten Pfad mit Schwung (Momentum) zum Punkt
 
 VERFÜGBARE REWARD-TERME:
 ${TERM_DOCS}
@@ -71,11 +89,11 @@ ZIEL DES NUTZERS: "${goal}"
 Aufgabe: Passe die Trainingsregeln an, damit der Roboter nach dem Training das Gewünschte wirklich kann.
 Wähle Gewichte konservativ, aber wirksam; deaktiviere Terme, die dem Ziel widersprechen.
 Wenn das Ziel Bewegung über Zeit braucht (Springen, Tanzen, Aufstehen) und keine Imitation aktiv ist, erkläre es und setze trotzdem sinnvolle Terme.
-Wenn Welt/Punkt-Modus helfen (z. B. Treppen → Welt mit Treppen aktivieren, Ziel verfolgen → pointMode), setze sie.
+Wenn Welt/Punkt-Modus helfen (z. B. Treppen → Welt mit Treppen, Ziel verfolgen → point.mode "frei" oder "pfad" + Reward-Term "pointChase"), setze sie.
 turbo: 1=stabil, 16=schnell, 64=maximal (nur bei einfachen Zielen hoch setzen). resetFirst=true bei grundlegend neuem Bewegungsmuster.
 
 Antworte AUSSCHLIESSLICH mit JSON (kein Markdown) nach diesem Schema:
-{"reward":{"<termId>":{"enabled":bool,"weight":number,"param":number}},"pointMode":bool,"world":{"enabled":bool,"difficulty":number,"density":number,"features":{"treppen":bool,"huegel":bool,"loecher":bool,"hindernisse":bool,"stange":bool}},"turbo":1,"resetFirst":bool,"explanation":"max. 4 Sätze, Deutsch, warum diese Regeln zum Ziel führen"}`;
+{"reward":{"<termId>":{"enabled":bool,"weight":number,"param":number}},"point":{"mode":"frei","radius":1.5,"speedByDist":true,"maxSpeed":0.25,"fullDist":1.5},"world":{"enabled":bool,"difficulty":number,"density":number,"features":{"treppen":bool,"huegel":bool,"loecher":bool,"hindernisse":bool,"stange":bool}},"turbo":1,"resetFirst":bool,"explanation":"max. 4 Sätze, Deutsch, warum diese Regeln zum Ziel führen"}`;
 }
 
 export async function applyGoalWithGemini(
@@ -103,6 +121,15 @@ export async function applyGoalWithGemini(
       const j = await res.json();
       detail = j?.error?.message ?? detail;
     } catch { /* ignore */ }
+    if (/location is not supported/i.test(detail)) {
+      throw new Error(
+        "Gemini: Dein aktueller Standort/Netz wird von der Gemini-API nicht unterstützt. "
+        + "Wechsle ggf. ins WLAN oder nutze ein VPN mit passendem Land.",
+      );
+    }
+    if (/API key not valid|API_KEY_INVALID/i.test(detail)) {
+      throw new Error("Gemini: Der API-Key ist ungültig – prüfe ihn im KI-Panel.");
+    }
     throw new Error(`Gemini-Fehler: ${detail}`);
   }
   const data = await res.json();
@@ -143,6 +170,18 @@ export function parsePatch(text: string): GeminiPatch {
     if (Object.keys(reward).length) patch.reward = reward;
   }
   if (typeof obj.pointMode === "boolean") patch.pointMode = obj.pointMode;
+  if (obj.point && typeof obj.point === "object") {
+    const p: NonNullable<GeminiPatch["point"]> = {};
+    if (obj.point.mode === "aus" || obj.point.mode === "frei"
+      || obj.point.mode === "umkreis" || obj.point.mode === "pfad") {
+      p.mode = obj.point.mode;
+    }
+    if (Number.isFinite(obj.point.radius)) p.radius = clampNum(obj.point.radius, 0.3, 6);
+    if (typeof obj.point.speedByDist === "boolean") p.speedByDist = obj.point.speedByDist;
+    if (Number.isFinite(obj.point.maxSpeed)) p.maxSpeed = clampNum(obj.point.maxSpeed, 0.05, 1.2);
+    if (Number.isFinite(obj.point.fullDist)) p.fullDist = clampNum(obj.point.fullDist, 0.3, 6);
+    if (Object.keys(p).length) patch.point = p;
+  }
   if (obj.world && typeof obj.world === "object") {
     const w: any = {};
     if (typeof obj.world.enabled === "boolean") w.enabled = obj.world.enabled;
@@ -172,11 +211,11 @@ function clampNum(v: number, lo: number, hi: number): number {
 export function loadGeminiPrefs(): { apiKey: string; model: GeminiModelId } {
   try {
     return {
-      apiKey: localStorage.getItem("mdt_v2_gemini_key") ?? "",
+      apiKey: localStorage.getItem("mdt_v2_gemini_key") ?? DEFAULT_GEMINI_KEY,
       model: (localStorage.getItem("mdt_v2_gemini_model") as GeminiModelId) ?? "gemini-3.5-flash-lite",
     };
   } catch {
-    return { apiKey: "", model: "gemini-3.5-flash-lite" };
+    return { apiKey: DEFAULT_GEMINI_KEY, model: "gemini-3.5-flash-lite" };
   }
 }
 

@@ -20,6 +20,7 @@ interface GeminiPanelProps {
   onApplyPatch: (actions: {
     reward?: Telemetry["reward"];
     pointMode?: boolean;
+    pointCfg?: Partial<Telemetry["pointCfg"]>;
     world?: Partial<Telemetry["world"]>;
     turbo?: number;
     resetFirst?: boolean;
@@ -72,7 +73,8 @@ export default function GeminiPanel({ tel, onApplyPatch, onTurbo }: GeminiPanelP
         imitationActive: !!tel.imitation?.playing,
         imitationName: tel.imitation?.name ?? null,
         worldEnabled: tel.world.enabled,
-        pointMode: tel.pointMode,
+        pointMode: tel.pointCfg?.mode ?? "aus",
+        pointRadius: tel.pointCfg?.radius ?? 2,
         generation: tel.es?.generation ?? 0,
       }, goal.trim());
 
@@ -95,6 +97,7 @@ export default function GeminiPanel({ tel, onApplyPatch, onTurbo }: GeminiPanelP
       onApplyPatch({
         reward,
         pointMode: patch.pointMode,
+        pointCfg: patch.point,
         world: patch.world
           ? {
               enabled: patch.world.enabled,
@@ -142,7 +145,8 @@ export default function GeminiPanel({ tel, onApplyPatch, onTurbo }: GeminiPanelP
           </Button>
         </div>
         <p className="mt-1.5 text-[10px] text-slate-500">
-          Kostenlos erstellen auf aistudio.google.com → „Get API key".
+          Standard-Key ist eingebaut – du musst nichts eintragen. Eigener Key:
+          kostenlos auf aistudio.google.com → „Get API key“.
         </p>
       </div>
 
@@ -213,7 +217,8 @@ export default function GeminiPanel({ tel, onApplyPatch, onTurbo }: GeminiPanelP
       )}
 
       <p className="text-[11px] leading-snug text-slate-500">
-        Gemini kann Reward-Gewichte, den Punkt-Modus, die Random-Welt und das
+        Gemini kann Reward-Gewichte, den Joystick-Punkt (Modus „Aus / Frei /
+        Umkreis / Pfad“ inkl. Tempo-Regeln), die Random-Welt und das
         Turbo-Level auf einmal anpassen – du musst nichts programmieren. Die
         Ergebnisse erscheinen als Toast; prüfe die Änderungen im
         Bewertungs-Panel.

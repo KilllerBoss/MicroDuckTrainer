@@ -9,7 +9,10 @@ MuJoCo-Roboter-Training direkt auf dem Android-Handy – **komplett offline**. E
 | 🌍 **Random-Welt-Generator** | Prozedurale Welten per Knopfdruck neu würfeln: **Treppen, Hügel, Löcher** (Fliesenboden), **Hindernisse**, **Balancierstange** – mit Schwierigkeit + Dichte-Reglern und Seed |
 | 🎬 **GLB-Animations-Imitation** | Eigene `.glb`-Animationen hochladen (z. B. Mixamo) → Knochen werden automatisch auf die Roboter-Gelenke gemappt → die ES lernt sie nachzumachen (Phase sin/cos in der Observation, Test-Modus spielt endlos ohne Reset) |
 | 🎯 **Punkt-Modus** | Der Joystick bewegt einen **3D-Punkt** in der Welt – die Trainingsregeln bestimmen, wie (und ob) der Roboter reagiert: „Zum Punkt laufen", „Vom Punkt weg" |
-| 🤖 **Gemini-Trainingsregeln** | Ziel in normalem Deutsch sagen („Ich will, dass der Roboter springen lernt") → **gemini-robotics-er-2-preview**, **gemini-3.5-flash-lite** oder **gemini-3.8-flash** passen Reward, Welt, Punkt-Modus und Turbo automatisch an – ganz ohne Programmieren |
+| 🧭 **Kamera-relativ** | Vorne ist immer dort, wohin du schaust: Joystick-oben = Blickrichtung der Kamera (nicht Welt-Norden) |
+| 🎯↩ **Punkt-Modi** | **Aus / Frei / Umkreis / Pfad**: Punkt abschaltbar, frei in der Arena, auf einstellbaren Umkreis um den Roboter begrenzt, oder mit **physikalisch berechnetem Pfad inkl. Momentum** (Roboter geht der Schwung-Kurve nach) |
+| 🏃 **Distanz → Tempo** | Einstellbar: Je weiter der Punkt, desto schneller läuft der Roboter (Max-Tempo + Volldistanz-Regler) |
+| 🤖 **Gemini-Trainingsregeln** | Ziel in normalem Deutsch sagen („Ich will, dass der Roboter springen lernt") → **gemini-robotics-er-2-preview**, **gemini-3.5-flash-lite** oder **gemini-3.8-flash** passen Reward, Welt, Punkt-Modus und Turbo automatisch an – ganz ohne Programmieren (Standard-Key eingebaut, eigener Key optional) |
 
 ## Features (v2.0)
 
@@ -35,8 +38,9 @@ MuJoCo-Roboter-Training direkt auf dem Android-Handy – **komplett offline**. E
 > **Hinweis v1.0 → v2.x:** v1.0 hatte eine andere Signatur – v1.0 vorher deinstallieren.
 
 ### Gemini einrichten (optional)
-1. Kostenlos einen API-Key erstellen: [aistudio.google.com](https://aistudio.google.com) → „Get API key"
-2. In der App: **KI**-Panel → Key eintragen (wird nur lokal gespeichert) → Modell wählen → Ziel beschreiben → „Regeln automatisch anpassen"
+1. Ein **Standard-Key ist eingebaut** – Gemini funktioniert sofort (sofern Land/Netz von Gemini unterstützt wird)
+2. Eigener Key (optional): kostenlos erstellen: [aistudio.google.com](https://aistudio.google.com) → „Get API key"
+3. In der App: **KI**-Panel → Key eintragen (wird nur lokal gespeichert) → Modell wählen → Ziel beschreiben → „Regeln automatisch anpassen"
 
 ## Nutzung
 

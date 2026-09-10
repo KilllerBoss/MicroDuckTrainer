@@ -1,10 +1,11 @@
 "use client";
 
-// ── MicroDuck Trainer v2.0 – Steuerungs-Panel (Gamepad + Mappings) ───────────
+// ── MicroDuck Trainer v2.2 – Steuerungs-Panel (Gamepad + Mappings + Punkt) ───
 
 import { useState } from "react";
 import { Switch } from "@/components/ui/switch";
-import type { Telemetry } from "@/lib/md/app-core";
+import { Slider } from "@/components/ui/slider";
+import type { Telemetry, PointCfg, PointModeState } from "@/lib/md/app-core";
 import type { MappingEntry } from "@/lib/md/mapping";
 import MappingEditor from "./MappingEditor";
 import { Gamepad2, ShieldCheck, Crosshair } from "lucide-react";
@@ -16,13 +17,26 @@ interface ControlPanelProps {
   onGamepad: (v: boolean) => void;
   onAutoRecovery: (v: boolean) => void;
   onMappings: (m: MappingEntry[]) => void;
-  onPointMode: (v: boolean) => void;
+  onPointCfg: (patch: Partial<PointCfg>) => void;
 }
 
+const POINT_MODES: { id: PointModeState; label: string; hint: string }[] = [
+  { id: "aus", label: "Aus", hint: "Kein Punkt – Joystick steuert den Roboter direkt." },
+  { id: "frei", label: "Frei", hint: "Punkt läuft frei in der Arena; der Roboter verfolgt ihn." },
+  { id: "umkreis", label: "Umkreis", hint: "Der Punkt bleibt immer im einstellbaren Umkreis um den Roboter." },
+  { id: "pfad", label: "Pfad", hint: "Pfad Roboter → Punkt wird physikalisch mit Schwung (Momentum) berechnet – der Roboter geht ihm nach." },
+];
+
 export default function ControlPanel(props: ControlPanelProps) {
-  const { tel, gamepadOn, autoRecovery, onGamepad, onAutoRecovery, onMappings, onPointMode } = props;
+  const { tel, gamepadOn, autoRecovery, onGamepad, onAutoRecovery, onMappings, onPointCfg } = props;
   const [showEditor, setShowEditor] = useState(false);
   const modelId = tel.modelId ?? "microduck";
+  const pc: PointCfg = tel.pointCfg ?? {
+    mode: "aus", radius: 2, speedByDist: true,
+    maxSpeed: modelId === "unitree_g1" ? 0.6 : 0.25, fullDist: 1.5,
+  };
+  const activeHint = POINT_MODES.find((m) => m.id === pc.mode)?.hint ?? "";
+  const maxSpeedMax = modelId === "unitree_g1" ? 1.2 : 0.25;
 
   return (
     <div className="space-y-4">
@@ -39,22 +53,106 @@ export default function ControlPanel(props: ControlPanelProps) {
         <Switch checked={gamepadOn} onCheckedChange={onGamepad} aria-label="Gamepad ein/aus" />
       </div>
 
-      <div className="flex items-center justify-between rounded-lg border border-amber-500/25 bg-black/30 p-3">
+      {/* ── Joystick-Punkt (v2.2) ── */}
+      <div className="rounded-lg border border-amber-500/25 bg-black/30 p-3">
         <div className="flex items-center gap-2.5">
           <Crosshair className="h-5 w-5 text-amber-300" />
           <div>
-            <div className="text-sm text-slate-200">Punkt-Modus</div>
+            <div className="text-sm text-slate-200">Joystick-Punkt</div>
             <div className="text-[11px] text-slate-500">
-              Joystick bewegt einen 3D-Punkt – Reaktion in der Bewertung einstellen
-              („Zum Punkt laufen“ / „Vom Punkt weg“)
+              Kamera-relativ: Vorne ist immer dort, wohin du schaust
             </div>
           </div>
         </div>
-        <Switch
-          checked={tel.pointMode}
-          onCheckedChange={onPointMode}
-          aria-label="Punkt-Modus ein/aus"
-        />
+
+        <div className="mt-3 grid grid-cols-4 gap-1">
+          {POINT_MODES.map((m) => (
+            <button
+              key={m.id}
+              type="button"
+              onClick={() => onPointCfg({ mode: m.id })}
+              aria-pressed={pc.mode === m.id}
+              className={`h-9 rounded-md border text-xs transition-colors ${
+                pc.mode === m.id
+                  ? "border-amber-400/70 bg-amber-500/20 font-semibold text-amber-200"
+                  : "border-slate-700/60 text-slate-400 hover:border-amber-400/40 hover:text-amber-200"
+              }`}
+            >
+              {m.label}
+            </button>
+          ))}
+        </div>
+        <p className="mt-1.5 text-[11px] leading-snug text-slate-500">{activeHint}</p>
+
+        {pc.mode !== "aus" && (
+          <div className="mt-3 space-y-3 border-t border-amber-500/10 pt-3">
+            {(pc.mode === "umkreis" || pc.mode === "pfad") && (
+              <div>
+                <div className="mb-1.5 flex items-center justify-between text-xs">
+                  <span className="text-slate-400">Umkreis-Radius</span>
+                  <span className="font-mono text-amber-300">{pc.radius.toFixed(1)} m</span>
+                </div>
+                <Slider
+                  value={[pc.radius]}
+                  min={0.3}
+                  max={6}
+                  step={0.1}
+                  onValueChange={(v) => onPointCfg({ radius: v[0] })}
+                  className="[&_[data-slot=slider-range]]:bg-amber-400 [&_[data-slot=slider-thumb]]:border-amber-300"
+                />
+              </div>
+            )}
+
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs text-slate-400">
+                Weiterer Punkt = schneller laufen
+              </div>
+              <Switch
+                checked={pc.speedByDist}
+                onCheckedChange={(v) => onPointCfg({ speedByDist: v })}
+                aria-label="Tempo mit Distanz skalieren"
+              />
+            </div>
+
+            {pc.speedByDist && (
+              <>
+                <div>
+                  <div className="mb-1.5 flex items-center justify-between text-xs">
+                    <span className="text-slate-400">Max-Tempo</span>
+                    <span className="font-mono text-amber-300">{pc.maxSpeed.toFixed(2)} m/s</span>
+                  </div>
+                  <Slider
+                    value={[pc.maxSpeed]}
+                    min={0.05}
+                    max={maxSpeedMax}
+                    step={0.05}
+                    onValueChange={(v) => onPointCfg({ maxSpeed: v[0] })}
+                    className="[&_[data-slot=slider-range]]:bg-cyan-400 [&_[data-slot=slider-thumb]]:border-cyan-300"
+                  />
+                </div>
+                <div>
+                  <div className="mb-1.5 flex items-center justify-between text-xs">
+                    <span className="text-slate-400">Volles Tempo ab</span>
+                    <span className="font-mono text-amber-300">{pc.fullDist.toFixed(1)} m</span>
+                  </div>
+                  <Slider
+                    value={[pc.fullDist]}
+                    min={0.3}
+                    max={6}
+                    step={0.1}
+                    onValueChange={(v) => onPointCfg({ fullDist: v[0] })}
+                    className="[&_[data-slot=slider-range]]:bg-cyan-400 [&_[data-slot=slider-thumb]]:border-cyan-300"
+                  />
+                </div>
+              </>
+            )}
+
+            <p className="text-[10px] leading-snug text-slate-500">
+              Wie der Roboter auf den Punkt reagiert, stellst du im
+              Bewertungs-Panel ein („Zum Punkt laufen“ / „Vom Punkt weg“).
+            </p>
+          </div>
+        )}
       </div>
 
       <div className="flex items-center justify-between rounded-lg border border-cyan-500/20 bg-black/30 p-3">

@@ -27,6 +27,31 @@ import {
 export type Mode = "manuell" | "training" | "test";
 export type PolicySource = "onnx" | "es";
 
+// ── v2.2: Punkt-Modus-Konfiguration ──
+export type PointModeState = "aus" | "frei" | "umkreis" | "pfad";
+
+export interface PointCfg {
+  mode: PointModeState;
+  /** Max. Abstand Punkt ↔ Roboter in m (umkreis & pfad). */
+  radius: number;
+  /** Je weiter der Punkt, desto schneller läuft der Roboter. */
+  speedByDist: boolean;
+  /** Lauf-Tempo (m/s) bei voller Distanz. */
+  maxSpeed: number;
+  /** Distanz (m), ab der maxSpeed erreicht ist. */
+  fullDist: number;
+}
+
+export function defaultPointCfg(modelId: ModelId | null): PointCfg {
+  return {
+    mode: "aus",
+    radius: 2,
+    speedByDist: true,
+    maxSpeed: modelId === "unitree_g1" ? 0.6 : 0.25,
+    fullDist: 1.5,
+  };
+}
+
 export interface Telemetry {
   booted: boolean;
   loading: boolean;
@@ -49,9 +74,10 @@ export interface Telemetry {
   es: EsStats | null;
   mappings: MappingEntry[];
   reward: RewardConfig;
-  // ── v2.1 ──
+  // ── v2.1/2.2 ──
   world: WorldConfig;
-  pointMode: boolean;
+  pointMode: boolean; // abgeleitet: mode !== "aus"
+  pointCfg: PointCfg;
   point: [number, number];
   imitation: {
     name: string; duration: number; playing: boolean; time: number; mapped: number; manual: boolean;
@@ -90,11 +116,16 @@ export class TrainerCore {
   private pendingPolicyId: string | null = null;
   private pendingPoseId: string | null = null;
 
-  // ── v2.1: Welt, Punkt-Modus, Imitation ──
+  // ── v2.1: Welt, Imitation · v2.2: Punkt-Modus ──
   private worldCfg: WorldConfig = defaultWorldConfig();
   private worldBuild: WorldBuild | null = null;
-  private pointMode = false;
+  private pointCfg: PointCfg = defaultPointCfg(null);
   private point: [number, number] = [0.8, 0];
+  /** Momentum-Führpunkt (Modus "pfad"): folgt dem Punkt mit Feder-Dämpfer. */
+  private leader: { x: number; y: number; vx: number; vy: number } | null = null;
+  private trail: [number, number][] = [];
+  private trailTick = 0;
+  private markerShown = false;
   private imitClip: ImitClip | null = null;
   private imitPlaying = false;
   private imitManual = false;
@@ -176,8 +207,10 @@ export class TrainerCore {
       this.worldCfg = loadWorldPrefs();
       this.worldBuild = this.worldCfg.enabled ? generateWorld(this.worldCfg, id) : null;
       this.applyWorldVisuals();
-      this.pointMode = loadPointPrefs(id);
+      this.pointCfg = loadPointPrefs(id);
       this.point = [0.8, 0];
+      this.leader = null;
+      this.trail = [];
 
       const tasks: Promise<any>[] = [this.engine.load(id, this.worldBuild)];
       if (needRig && this.world) tasks.push(mountRig(this.world, id));
@@ -190,7 +223,7 @@ export class TrainerCore {
       this.g1Base = new Float32Array(this.engine.standPose);
       this.esObsExtra = 0;
       this.engine.setImitObs(false);
-      this.engine.targetPoint = this.pointMode ? [...this.point] as [number, number] : null;
+      this.engine.targetPoint = this.pointCfg.mode !== "aus" ? [...this.point] as [number, number] : null;
       this.prevAct = new Float32Array(meta.actionDim);
       this.actBuf = new Float32Array(meta.actionDim);
       // Mappings + Bewertung pro Modell laden (Persistenz)
@@ -219,6 +252,9 @@ export class TrainerCore {
     this.joy.x = 0;
     this.joy.y = 0;
     this.imitTime = 0;
+    this.leader = null;
+    this.trail = [];
+    this.trailTick = 0;
   }
 
   // ── Setter (von der UI) ─────────────────────────────────────────────────────
@@ -295,7 +331,7 @@ export class TrainerCore {
         : null;
       this.applyWorldVisuals();
       await this.engine.load(this.modelId ?? "microduck", this.worldBuild);
-      this.engine.targetPoint = this.pointMode ? ([...this.point] as [number, number]) : null;
+      this.engine.targetPoint = this.pointCfg.mode !== "aus" ? ([...this.point] as [number, number]) : null;
       this.error = null;
     } catch (err: any) {
       this.error = err?.message || String(err);
@@ -319,18 +355,51 @@ export class TrainerCore {
     this.world.setWorldProps(this.worldBuild ? buildWorldMeshes(this.worldBuild) : null);
   }
 
-  // ── v2.1: Punkt-Modus ──────────────────────────────────────────────────────
+  // ── v2.1/2.2: Punkt-Modus ────────────────────────────────────────────────
 
+  /** Legacy-Schalter (bool): true = frei, false = aus. */
   setPointMode(on: boolean): void {
-    this.pointMode = on;
-    if (this.modelId) savePointPrefs(this.modelId, on);
-    this.engine.targetPoint = on ? ([...this.point] as [number, number]) : null;
-    this.trainer?.setTargetPoint(on ? ([...this.point] as [number, number]) : null);
+    const mode: PointModeState = on
+      ? (this.pointCfg.mode === "aus" ? "frei" : this.pointCfg.mode)
+      : "aus";
+    this.setPointCfg({ mode });
+  }
+
+  setPointCfg(patch: Partial<PointCfg>): void {
+    const prevMode = this.pointCfg.mode;
+    const next: PointCfg = { ...this.pointCfg, ...patch };
+    // Sanfte Validierung
+    next.mode = ("aus|frei|umkreis|pfad".split("|") as PointModeState[]).includes(next.mode)
+      ? next.mode : "aus";
+    next.radius = clamp(next.radius, 0.3, 6);
+    next.maxSpeed = clamp(next.maxSpeed, 0.05, 1.2);
+    next.fullDist = clamp(next.fullDist, 0.3, 6);
+    this.pointCfg = next;
+    if (this.modelId) savePointPrefs(this.modelId, next);
+    if (next.mode !== prevMode) {
+      this.leader = null; // Momentum neu starten
+      this.trail = [];
+      if (next.mode === "aus") this.world?.setTargetPath(null);
+    }
+    const active = next.mode !== "aus";
+    if (!active) {
+      this.engine.targetPoint = null;
+      this.trainer?.setTargetPoint(null);
+      this.world?.setTargetPoint(0, 0, false);
+      this.world?.setTargetPath(null);
+      this.markerShown = false;
+    } else if (!this.engine.targetPoint) {
+      this.engine.targetPoint = [...this.point] as [number, number];
+    }
     this.emit();
   }
 
   get isPointMode(): boolean {
-    return this.pointMode;
+    return this.pointCfg.mode !== "aus";
+  }
+
+  get pointConfig(): PointCfg {
+    return { ...this.pointCfg };
   }
 
   // ── v2.1: Imitation ────────────────────────────────────────────────────────
@@ -491,7 +560,7 @@ export class TrainerCore {
         await this.trainer.init();
       }
       this.trainer.setReward(this.rewardCfg!);
-      this.trainer.setTargetPoint(this.pointMode ? ([...this.point] as [number, number]) : null);
+      this.trainer.setTargetPoint(this.pointCfg.mode !== "aus" ? ([...this.point] as [number, number]) : null);
       this.trainingActive = true;
       this.emit();
       await this.trainer.tryStartWorkers();
@@ -637,19 +706,69 @@ export class TrainerCore {
     const engine = this.engine;
     if (!engine.data || !engine.meta || !this.modelId) return;
 
-    // ── v2.1: Punkt-Modus – Joystick bewegt den 3D-Punkt ──
+    // ── v2.2: Punkt-Modus – Joystick bewegt den 3D-Punkt (KAMERA-RELATIV) ──
+    // Vorne ist immer die Blickrichtung der Kamera (Touch-Drehsensor der Chase-Cam):
+    // Joystick oben = weg von der Kamera, rechts = rechts von der Blickrichtung.
     const dtStep = this.stepMs() / 1000;
-    if (this.pointMode) {
+    const pm = this.pointCfg.mode;
+    if (pm !== "aus") {
+      const cy = this.world?.getCamYaw() ?? 0;
+      // Blickrichtung (MuJoCo-Frame, z-up): three-Cam-Yaw → Kamera sitzt bei
+      // (cos cy, -sin cy) relativ zum Roboter → vorne = (-cos cy, +sin cy).
+      const fx = -Math.cos(cy), fy = Math.sin(cy);
+      const rx = fy, ry = -fx; // rechts = (f_y, -f_x)
       const sp = 1.4 * dtStep;
       const lim = arenaHalf(this.modelId) - 0.15;
-      this.point[0] = Math.min(lim, Math.max(-lim, this.point[0] + this.joy.x * sp));
-      this.point[1] = Math.min(lim, Math.max(-lim, this.point[1] + this.joy.y * sp));
-      engine.targetPoint = [this.point[0], this.point[1]];
-      this.trainer?.setTargetPoint([this.point[0], this.point[1]]);
+      this.point[0] = clamp(this.point[0] + (this.joy.y * fx + this.joy.x * rx) * sp, -lim, lim);
+      this.point[1] = clamp(this.point[1] + (this.joy.y * fy + this.joy.x * ry) * sp, -lim, lim);
+
+      // Umkreis/Pfad: Punkt darf max. `radius` vom Roboter entfernt bleiben
+      const p0 = engine.torsoPos();
+      if (pm === "umkreis" || pm === "pfad") {
+        const dxp = this.point[0] - p0[0], dyp = this.point[1] - p0[1];
+        const dp = Math.hypot(dxp, dyp);
+        if (dp > this.pointCfg.radius) {
+          const k = this.pointCfg.radius / dp;
+          this.point[0] = p0[0] + dxp * k;
+          this.point[1] = p0[1] + dyp * k;
+        }
+      }
+
+      // Ziel für Roboter/Reward: bei "pfad" der Momentum-Führpunkt (Feder-Dämpfer)
+      let target: [number, number] = [this.point[0], this.point[1]];
+      if (pm === "pfad") {
+        if (!this.leader) this.leader = { x: p0[0], y: p0[1], vx: 0, vy: 0 };
+        const L = this.leader;
+        const kSpring = 16, zeta = 0.8; // Federrate + Dämpfungsgrad
+        const cDamp = 2 * Math.sqrt(kSpring) * zeta;
+        L.vx += (kSpring * (this.point[0] - L.x) - cDamp * L.vx) * dtStep;
+        L.vy += (kSpring * (this.point[1] - L.y) - cDamp * L.vy) * dtStep;
+        const vAbs = Math.hypot(L.vx, L.vy);
+        const vMax = Math.max(0.3, this.pointCfg.maxSpeed * 2.5);
+        if (vAbs > vMax) { L.vx *= vMax / vAbs; L.vy *= vMax / vAbs; }
+        L.x = clamp(L.x + L.vx * dtStep, -lim, lim);
+        L.y = clamp(L.y + L.vy * dtStep, -lim, lim);
+        target = [L.x, L.y];
+        if (++this.trailTick >= 5) { // Trail ~10 Hz → ~9 s Historie
+          this.trailTick = 0;
+          this.trail.push([L.x, L.y]);
+          if (this.trail.length > 90) this.trail.shift();
+        }
+      } else if (this.trail.length) {
+        this.trail = [];
+      }
+
+      engine.targetPoint = target;
+      this.trainer?.setTargetPoint(target);
       this.world?.setTargetPoint(this.point[0], this.point[1], true);
-    } else if (engine.targetPoint) {
+      this.markerShown = true;
+      this.world?.setTargetPath(pm === "pfad" && this.trail.length >= 2 ? this.trail : null);
+    } else if (engine.targetPoint || this.markerShown) {
       engine.targetPoint = null;
+      this.trainer?.setTargetPoint(null);
       this.world?.setTargetPoint(0, 0, false);
+      this.world?.setTargetPath(null);
+      this.markerShown = false;
     }
 
     // ── v2.1: Imitation – Zielpose je Policy-Step ──
@@ -692,7 +811,7 @@ export class TrainerCore {
     const meta = engine.meta;
 
     // Command-Slots: Punkt-Modus → Richtung zum Punkt; sonst Mappings/Test
-    if (this.pointMode && engine.targetPoint) {
+    if (this.pointCfg.mode !== "aus" && engine.targetPoint) {
       const [tx, ty] = engine.targetPoint;
       const p = engine.torsoPos();
       const dx = tx - p[0], dy = ty - p[1];
@@ -705,7 +824,11 @@ export class TrainerCore {
       while (yerr > Math.PI) yerr -= 2 * Math.PI;
       while (yerr < -Math.PI) yerr += 2 * Math.PI;
       if (dist > 0.12) {
-        engine.cmd[0] = clamp(VEL_FWD * 0.9 * Math.max(0, Math.cos(yerr)), VEL_BACK, VEL_FWD);
+        // v2.2: Tempo optional mit Distanz skalieren (weiter = schneller)
+        const scale = this.pointCfg.speedByDist
+          ? clamp(dist / Math.max(0.2, this.pointCfg.fullDist), 0.15, 1)
+          : 1;
+        engine.cmd[0] = clamp(this.pointCfg.maxSpeed * scale * Math.max(0, Math.cos(yerr)), VEL_BACK, VEL_FWD);
         engine.cmd[1] = clamp(lat * 1.2, -VEL_LAT, VEL_LAT);
         engine.cmd[2] = clamp(1.4 * yerr, -VEL_ANG, VEL_ANG);
       } else {
@@ -845,8 +968,8 @@ export class TrainerCore {
       return;
     }
 
-    // v2.1: Punkt-Modus – cmd Richtung Punkt (für ES-Obs)
-    if (this.pointMode && engine.targetPoint) {
+    // v2.2: Punkt-Modus – cmd Richtung Punkt (für ES-Obs), Tempo mit Distanz
+    if (this.pointCfg.mode !== "aus" && engine.targetPoint) {
       const [tx, ty] = engine.targetPoint;
       const p = engine.torsoPos();
       const dx = tx - p[0], dy = ty - p[1];
@@ -856,7 +979,10 @@ export class TrainerCore {
       let yerr = desired - yaw;
       while (yerr > Math.PI) yerr -= 2 * Math.PI;
       while (yerr < -Math.PI) yerr += 2 * Math.PI;
-      engine.cmd[0] = dist > 0.15 ? 0.35 * Math.max(0, Math.cos(yerr)) : 0;
+      const scale = this.pointCfg.speedByDist
+        ? clamp(dist / Math.max(0.2, this.pointCfg.fullDist), 0.15, 1)
+        : 1;
+      engine.cmd[0] = dist > 0.15 ? this.pointCfg.maxSpeed * scale * Math.max(0, Math.cos(yerr)) : 0;
       engine.cmd[2] = clamp(1.2 * yerr, -1, 1);
     }
 
@@ -975,7 +1101,8 @@ export class TrainerCore {
       mappings: this.mappings,
       reward: this.rewardCfg ?? (this.modelId ? loadRewardConfig(this.modelId) : ({} as RewardConfig)),
       world: this.worldCfg,
-      pointMode: this.pointMode,
+      pointMode: this.pointCfg.mode !== "aus",
+      pointCfg: { ...this.pointCfg },
       point: [this.point[0], this.point[1]],
       imitation: this.imitClip
         ? {
@@ -1055,12 +1182,31 @@ function saveWorldPrefs(cfg: WorldConfig): void {
   try { localStorage.setItem("mdt_v2_world", JSON.stringify(cfg)); } catch { /* ignore */ }
 }
 
-function loadPointPrefs(modelId: ModelId): boolean {
-  try { return localStorage.getItem(`mdt_v2_point_${modelId}`) === "1"; } catch { return false; }
+function loadPointPrefs(modelId: ModelId): PointCfg {
+  const def = defaultPointCfg(modelId);
+  try {
+    const raw = localStorage.getItem(`mdt_v2_pointcfg_${modelId}`);
+    if (raw) {
+      const p = JSON.parse(raw) as Partial<PointCfg>;
+      if (p && typeof p === "object") {
+        return {
+          ...def,
+          ...p,
+          mode: ("aus|frei|umkreis|pfad".split("|") as PointModeState[]).includes(p.mode as PointModeState)
+            ? (p.mode as PointModeState) : def.mode,
+        };
+      }
+    }
+    // Migration vom alten Boolean-Pref
+    if (localStorage.getItem(`mdt_v2_point_${modelId}`) === "1") {
+      return { ...def, mode: "frei" };
+    }
+  } catch { /* ignore */ }
+  return def;
 }
 
-function savePointPrefs(modelId: ModelId, on: boolean): void {
-  try { localStorage.setItem(`mdt_v2_point_${modelId}`, on ? "1" : "0"); } catch { /* ignore */ }
+function savePointPrefs(modelId: ModelId, cfg: PointCfg): void {
+  try { localStorage.setItem(`mdt_v2_pointcfg_${modelId}`, JSON.stringify(cfg)); } catch { /* ignore */ }
 }
 
 export default TrainerCore;

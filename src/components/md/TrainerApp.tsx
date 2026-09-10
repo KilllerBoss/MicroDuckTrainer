@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { toast } from "@/hooks/use-toast";
 import { Button } from "@/components/ui/button";
-import TrainerCore, { type Telemetry } from "@/lib/md/app-core";
+import TrainerCore, { type Telemetry, type PointCfg } from "@/lib/md/app-core";
 import type { ModelId } from "@/lib/md/models";
 import { getModel } from "@/lib/md/models";
 import { TURBO_LEVELS, type TurboLevel } from "@/lib/md/es";
@@ -48,6 +48,7 @@ const INITIAL_TEL: Telemetry = {
   world: { enabled: false, seed: 0, difficulty: 0.4, density: 0.5,
     features: { treppen: true, huegel: true, loecher: false, hindernisse: true, stange: false } },
   pointMode: false,
+  pointCfg: { mode: "aus", radius: 2, speedByDist: true, maxSpeed: 0.25, fullDist: 1.5 },
   point: [0.8, 0],
   imitation: null,
 };
@@ -198,11 +199,12 @@ export default function TrainerApp() {
     c.setReward(next);
   }, [tel.reward]);
 
-  const onPointMode = useCallback((v: boolean) => core()?.setPointMode(v), []);
+  const onPointCfg = useCallback((patch: Partial<PointCfg>) => core()?.setPointCfg(patch), []);
 
   const onGeminiPatch = useCallback((actions: {
     reward?: Telemetry["reward"];
     pointMode?: boolean;
+    pointCfg?: Partial<PointCfg>;
     world?: Partial<Telemetry["world"]>;
     turbo?: number;
     resetFirst?: boolean;
@@ -211,6 +213,7 @@ export default function TrainerApp() {
     if (!c) return;
     if (actions.reward) c.setReward(actions.reward);
     if (typeof actions.pointMode === "boolean") c.setPointMode(actions.pointMode);
+    if (actions.pointCfg) c.setPointCfg(actions.pointCfg);
     if (actions.world) {
       void c.setWorld({ ...tel.world, ...actions.world,
         features: { ...tel.world.features, ...(actions.world.features ?? {}) } });
@@ -413,7 +416,13 @@ export default function TrainerApp() {
           {tel.recovering && <Chip label="Recovery" value="aktiv" accent />}
           {tel.fallen && !tel.recovering && <Chip label="Sturz" value="erkannt" accent />}
           {tel.world.enabled && <Chip label="Welt" value="aktiv" />}
-          {tel.pointMode && <Chip label="Punkt" value={`${tel.point[0].toFixed(1)}, ${tel.point[1].toFixed(1)}`} />}
+          {tel.pointMode && (
+            <Chip
+              label={`Punkt·${tel.pointCfg?.mode ?? "frei"}`}
+              value={`${tel.point[0].toFixed(1)}, ${tel.point[1].toFixed(1)}`}
+              accent
+            />
+          )}
           {tel.imitation?.playing && (
             <Chip label="Anim" value={`${tel.imitation.time.toFixed(1)}/${tel.imitation.duration.toFixed(1)}s`} accent />
           )}
@@ -499,7 +508,7 @@ export default function TrainerApp() {
                 onGamepad={setGamepadOn}
                 onAutoRecovery={(v) => { setAutoRecovery(v); core()?.setAutoRecovery(v); }}
                 onMappings={onMappings}
-                onPointMode={onPointMode}
+                onPointCfg={onPointCfg}
               />
             )}
             {panel === "world" && (

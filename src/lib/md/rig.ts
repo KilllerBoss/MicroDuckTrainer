@@ -312,6 +312,10 @@ export interface World {
   setWorldProps: (group: THREE.Group | null) => void;
   /** v2.1: Joystick-Punkt-Marker setzen (Punkt-Modus). */
   setTargetPoint: (x: number, y: number, visible: boolean) => void;
+  /** v2.2: Kamera-Gierwinkel (three.js-Raum) für kamera-relativen Joystick. */
+  getCamYaw: () => number;
+  /** v2.2: Pfad-Trail setzen (MuJoCo x/y-Punkte) oder ausblenden (null). */
+  setTargetPath: (pts: [number, number][] | null) => void;
   dispose: () => void;
 }
 
@@ -400,6 +404,27 @@ export async function createWorld(container: HTMLElement): Promise<World> {
   scene.add(worldProps);
   let markerPulse = 0;
 
+  // v2.2: Pfad-Trail (Momentum-Führpunkt) – Linie knapp über dem Boden
+  const PATH_MAX = 256;
+  const pathGeom = new THREE.BufferGeometry();
+  pathGeom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array(PATH_MAX * 3), 3),
+  );
+  pathGeom.setDrawRange(0, 0);
+  const pathLine = new THREE.Line(
+    pathGeom,
+    new THREE.LineBasicMaterial({
+      color: 0xffb14d,
+      transparent: true,
+      opacity: 0.65,
+      depthWrite: false,
+    }),
+  );
+  pathLine.frustumCulled = false;
+  pathLine.visible = false;
+  scene.add(pathLine);
+
   let duckRig: DuckRig | null = null;
   let g1Rig: G1Rig | null = null;
 
@@ -457,6 +482,25 @@ export async function createWorld(container: HTMLElement): Promise<World> {
     setTargetPoint(x, y, visible) {
       marker.visible = visible;
       if (visible) marker.position.set(x, 0.03, -y);
+    },
+    getCamYaw() {
+      return camSph.yaw;
+    },
+    setTargetPath(pts) {
+      if (!pts || pts.length < 2) {
+        pathLine.visible = false;
+        return;
+      }
+      const n = Math.min(pts.length, PATH_MAX);
+      const pos = pathGeom.attributes.position as THREE.BufferAttribute;
+      for (let i = 0; i < n; i++) {
+        // MuJoCo (x, y) → three (x, y_up, -y)
+        pos.setXYZ(i, pts[i][0], 0.02, -pts[i][1]);
+      }
+      pathGeom.setDrawRange(0, n);
+      pos.needsUpdate = true;
+      pathGeom.computeBoundingSphere();
+      pathLine.visible = true;
     },
     updateCamera(dt) {
       if (marker.visible) {
