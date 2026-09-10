@@ -28,6 +28,8 @@ interface TrainingPanelProps {
   onTrainCfg: (patch: Partial<Telemetry["trainCfg"]>) => void;
   onExport: () => void;
   onImport: () => void;
+  // v2.4
+  onTrainPreview: (on: boolean) => void;
 }
 
 function fmt(n: number | undefined | null, digits = 2): string {
@@ -38,7 +40,7 @@ function fmt(n: number | undefined | null, digits = 2): string {
 export default function TrainingPanel(props: TrainingPanelProps) {
   const {
     tel, turbo, onTurbo, onStart, onStop, onShowBest, onSave, onLoad, hasSaved,
-    onTrainCfg, onExport, onImport,
+    onTrainCfg, onExport, onImport, onTrainPreview,
   } = props;
   const es = tel.es;
   const [watchBest, setWatchBest] = useState(false);
@@ -84,6 +86,18 @@ export default function TrainingPanel(props: TrainingPanelProps) {
             </button>
           ))}
         </div>
+      </div>
+
+      {/* v2.4: Live-Vorschau – der Roboter zeigt das Training sichtbar */}
+      <div className="flex items-center justify-between gap-3 rounded-lg border border-cyan-500/20 bg-black/20 p-3">
+        <div className="min-w-0">
+          <div className="text-xs font-semibold text-cyan-200">Live-Vorschau (empfohlen AN)</div>
+          <p className="mt-0.5 text-[10px] leading-snug text-slate-500">
+            Der Roboter übt sichtbar mit und wird von Generation zu Generation
+            besser. Aus = Training läuft unsichtbar im Hintergrund.
+          </p>
+        </div>
+        <Switch checked={tel.trainPreview} onCheckedChange={onTrainPreview} />
       </div>
 
       {/* Status */}

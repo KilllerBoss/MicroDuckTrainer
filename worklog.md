@@ -77,3 +77,21 @@ Work Log:
 Stage Summary:
 - Download: https://github.com/KilllerBoss/MicroDuckTrainer/releases/download/v2.3.0/MicroDuckTrainer-v2.3.apk
 - Release-Seite: https://github.com/KilllerBoss/MicroDuckTrainer/releases/tag/v2.3.0
+
+---
+Task ID: 8 (v2.4 Live-Vorschau + Recovery-Fix)
+Agent: main (Super Z)
+Task: Nutzer-Meldung "beide Roboter bewegen sich nicht, lernt nichts" despite v2.3 → Root-Cause + Fix + QA + Release
+
+Work Log:
+- Verifiziert: v2.3-Trainingskern (Profi-Tricks, Cross-Species-Imitation, Worker-Spiegel) komplett im Repo; v2.3.0 war released.
+- Root-Cause-Analyse der Nutzer-Wahrnehmung: (1) Training läuft headless in Workern → sichtbarer Roboter stand einfach rum (kein Feedback). (2) Test-Modus setzte cmd=(0,0,0) → cmd-trainierte Policy stand absichtlich. (3) Auto-Recovery hing ENDLOS in Bauchlage: upright-Bedingung verlangte projGravZ < -0.85, in Bauchlage ≈ 0 → nie erfüllbar.
+- v2.4-Fixes (app-core.ts): Live-Trainings-Vorschau (startTraining → Test-Modus + source="es" + updateEsView; Warm-Start-Läufer sofort sichtbar), Auto-Geh-Befehl für Vorschau/„Beste zeigen" (Zufalls-cmd alle 2,5–5 s, 90 % vorwärts), Recovery-Timeout (150 Steps ≈ 3 s Sim → sanfter Keyframe-Reset) + erweiterte Upright-Bedingung (Höhe ≥ 80 % Ziel), Persistenz-Schalter mdt_v2_preview.
+- v2.4-Fixes (es.ts): Curriculum hartnäckiger (Boden 0.35 statt 0.15, Aufstieg ab Sturzrate < 0.12 statt < 0.05, Abbau erst > 0.45) — Tempo klebte sonst am Minimum und die Policy lernte Stehen statt Laufen.
+- UI: TrainingPanel Live-Vorschau-Switch (default AN) + TrainerApp-Verdrahtung (trainPreview in Telemetry/INITIAL_TEL).
+- QA via agent-browser (headless, Timer gedrosselt auf ~3 Hz → Alles in Zeitlupe, echte Geräte 50 Hz): Training startet, Generatoren steigen (0→37), 732 Steps/s, 1 Worker, Best-Ever 1036. Ente läuft SICHTBAR in der Vorschau (gemessen 0.11 und 0.29 m/s), Sturz → Recovery → Timeout-Reset → weiterüben bestätigt. Screenshots: scripts/qa_duck_state.png, qa_duck_walking.png.
+- Bekannt/erwartet: Sturzrate während Exploration 0.3-0.6 (Stöße+Noise+Sigma 0.08) — Anker-Restart + Curriculum halten das System gesund; Vorschau zeigt bestEver-Mitglied, wird mit Generationen stabiler.
+
+Stage Summary:
+- v2.4 (versionCode 6): Live-Vorschau + Auto-Gehen + Recovery-Timeout + Curriculum-Härtung.
+- APK-Build + Release v2.4.0 folgen im nächsten Task.

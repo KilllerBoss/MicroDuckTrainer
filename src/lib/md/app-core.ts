@@ -115,6 +115,7 @@ export interface Telemetry {
   reward: RewardConfig;
   // ── v2.1/2.2 ──
   trainCfg: TrainCfg;
+  trainPreview: boolean; // v2.4: Live-Vorschau an/aus
   customCode: { name: string; enabled: boolean } | null;
   world: WorldConfig;
   pointMode: boolean; // abgeleitet: mode !== "aus"
@@ -177,6 +178,11 @@ export class TrainerCore {
   private imitCenter: Float32Array | null = null;
   /** v2.3: Höhen-Skalierung der Clip-Wurzel (Human → Roboter). */
   private imitScaleY = 1;
+  // v2.4: Live-Trainings-Vorschau – der sichtbare Roboter übt sichtbar mit
+  // (Headless-Rollouts allein sahen wie „bewegt sich nie“ aus!)
+  private trainPreview = true;
+  private previewCmd: [number, number, number] = [0.15, 0, 0];
+  private previewCmdT = 0;
   /** v2.3: Wie lange der Joystick schon losgelassen ist (s) – Punkt fährt heim. */
   private joyIdle = 0;
   private esObsExtra = 0; // Obs-Extra der aktuellen esView
@@ -278,6 +284,10 @@ export class TrainerCore {
       this.mappings = loadMapping(id);
       this.rewardCfg = loadRewardConfig(id);
       this.trainCfg = loadTrainPrefs(id);
+      try {
+        const pv = localStorage.getItem("mdt_v2_preview");
+        if (pv !== null) this.trainPreview = pv === "1";
+      } catch { /* ignore */ }
       this.testUptime = 0;
       this.testReward = 0;
       this.testStepN = 0;
@@ -693,6 +703,14 @@ export class TrainerCore {
       this.trainer.setReward(this.rewardCfg!);
       this.trainer.setTargetPoint(this.pointCfg.mode !== "aus" ? ([...this.point] as [number, number]) : null);
       this.applyTrainCfg();
+      // v2.4: Live-Vorschau – Test-Modus + beste Policy sofort sichtbar (vor
+      // Gen 1: die Warm-Start-Policy, die schon laufen kann!). Sonst steht der
+      // sichtbare Roboter nur rum und Training wirkt wie „passiert nichts“.
+      // Quelle "es" (winziges MLP statt ONNX-WASM): kein CPU-Wettkampf mit
+      // den Eval-Workern → Kontroll-Loop bleibt bei 50 Hz.
+      if (this.mode !== "test") this.setMode("test");
+      this.updateEsView();
+      this.source = "es";
       this.trainingActive = true;
       this.emit();
       await this.trainer.tryStartWorkers();
@@ -752,6 +770,16 @@ export class TrainerCore {
   showBest() {
     this.updateEsView();
     this.source = "es";
+    // v2.4: Test-Modus + Auto-Gehen, sonst steht die cmd-trainierte Policy
+    // bei Befehl (0,0,0) nur rum und der Nutzer denkt, sie kann nichts.
+    if (this.mode !== "test") this.setMode("test");
+    this.emit();
+  }
+
+  /** v2.4: Live-Trainings-Vorschau ein/aus (persistiert global). */
+  setTrainPreview(on: boolean): void {
+    this.trainPreview = on;
+    try { localStorage.setItem("mdt_v2_preview", on ? "1" : "0"); } catch { /* ignore */ }
     this.emit();
   }
 
@@ -932,6 +960,18 @@ export class TrainerCore {
     // Vorne ist immer die Blickrichtung der Kamera (Touch-Drehsensor der Chase-Cam):
     // Joystick oben = weg von der Kamera, rechts = rechts von der Blickrichtung.
     const dtStep = this.stepMs() / 1000;
+    // ── v2.4: Live-Vorschau – Befehls-Zufall wie im Training (2,5–5 s Takt) ──
+    if (this.mode === "test" && this.trainPreview) {
+      this.previewCmdT -= dtStep;
+      if (this.previewCmdT <= 0) {
+        this.previewCmdT = 2.5 + Math.random() * 2.5;
+        const cap = Math.max(0.1, this.trainCfg.cmdFwd);
+        // 90 % vorwärts (der Warm-Start-Läufer ist für Vorwärts validiert),
+        // sanftes Gieren – die Vorschau soll Laufen zeigen, nicht Stürze.
+        const fwd = Math.random() < 0.9 ? 0.5 + Math.random() * 0.5 : -0.25 * Math.random();
+        this.previewCmd = [cap * fwd, 0, (Math.random() * 2 - 1) * 0.25];
+      }
+    }
     const pm = this.pointCfg.mode;
     if (pm !== "aus") {
       const cy = this.world?.getCamYaw() ?? 0;
@@ -1078,7 +1118,14 @@ export class TrainerCore {
       }
     } else {
       let vx = 0, vy = 0, wz = 0;
-      if (this.mode !== "test") {
+      // v2.4: Live-Vorschau/Auto-Gehen – die ES-Policy bekommt einen sichtbaren
+      // Geh-Befehl (Training läuft headless; ohne das wirkt es wie „bewegt sich
+      // nie“. Auch nach "Beste zeigen": cmd 0 = Policy steht absichtlich!)
+      const previewOn = this.mode === "test" && this.trainPreview
+        && (this.trainingActive || this.source === "es") && !this.recovering;
+      if (previewOn) {
+        vx = this.previewCmd[0]; vy = this.previewCmd[1]; wz = this.previewCmd[2];
+      } else if (this.mode !== "test") {
         for (const m of this.mappings) {
           if (m.targetType !== "cmd") continue;
           const v = (m.source === "joyX" ? this.joy.x : this.joy.y) * m.gain;
@@ -1230,6 +1277,11 @@ export class TrainerCore {
         : 1;
       engine.cmd[0] = dist > 0.15 ? this.pointCfg.maxSpeed * scale * Math.max(0, Math.cos(yerr)) : 0;
       engine.cmd[2] = clamp(1.2 * yerr, -1, 1);
+    } else if (this.mode === "test" && this.trainPreview
+      && (this.trainingActive || this.source === "es") && !this.recovering) {
+      // v2.4: Live-Vorschau – Geh-Befehl, damit der G1 sichtbar übt/zeigt
+      engine.cmd[0] = this.previewCmd[0];
+      engine.cmd[2] = this.previewCmd[2];
     }
 
     // Training/Test: ES-Policy (G1 hat keine ONNX-Policies)
@@ -1277,6 +1329,21 @@ export class TrainerCore {
   private stepRecovery() {
     const engine = this.engine;
     const meta = engine.meta;
+    // v2.4: Notbremse – schafft die Policy die Standpose nicht (z. B. Ente in
+    // Bauchlage: projGravZ ≈ 0 → "aufrecht" nie erfüllbar → endlose Liegezeit),
+    // nach ~3 s Sim sanft aufs Keyframe zurücksetzen. Letzte Stufe der Kette
+    // (Blenden → Keyframe), damit die Vorschau immer weiterläuft.
+    if (this.recoverySteps >= 150) {
+      this.recovering = false;
+      this.recoverySteps = 0;
+      this.recoveryUpright = 0;
+      this.fallDebounce = 0;
+      engine.resetToKeyframe();
+      engine.lastAction.fill(0);
+      this.prevAct.fill(0);
+      this.emit();
+      return;
+    }
     const stand = meta.id === "microduck" ? Float32Array.from(meta.defaultPose) : engine.standPose;
     const ctrl = engine.data.ctrl as Float32Array;
     for (let j = 0; j < meta.actionDim; j++) {
@@ -1284,7 +1351,11 @@ export class TrainerCore {
     }
     engine.stepPhysics();
     this.recoverySteps++;
-    const upright = engine.projGravZ() < -0.85 && !engine.isFallen();
+    // v2.4: Ente in Bauchlage hat projGravZ ≈ 0 → zusätzlich Höhe akzeptieren:
+    // aufrecht = entweder sauber aufrecht ODER Höhe wieder im Stand-Bereich.
+    const gz = engine.projGravZ();
+    const upright = (gz < -0.85 || engine.height() >= meta.targetHeight * 0.8)
+      && !engine.isFallen();
     this.recoveryUpright = upright ? this.recoveryUpright + 1 : 0;
     if (this.recoveryUpright >= 50) {
       // 1 s aufrecht → Policy übernimmt wieder (Zustand läuft weiter)
@@ -1351,6 +1422,7 @@ export class TrainerCore {
       mappings: this.mappings,
       reward: this.rewardCfg ?? (this.modelId ? loadRewardConfig(this.modelId) : ({} as RewardConfig)),
       trainCfg: { ...this.trainCfg },
+      trainPreview: this.trainPreview,
       customCode: this.rewardCfg?.custom
         ? { name: this.rewardCfg.custom.name, enabled: this.rewardCfg.custom.enabled }
         : null,

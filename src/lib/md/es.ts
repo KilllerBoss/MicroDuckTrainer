@@ -643,13 +643,18 @@ export class EsTrainer {
     return cmd;
   }
 
-  /** v2.3: Curriculum-Schritt nach jeder Generation (Tempo-Treppe). */
+  /** v2.3: Curriculum-Schritt nach jeder Generation (Tempo-Treppe).
+   *  v2.4: Hartnäckiger ausgelegt – mit der alten Schwelle (Erhöhung erst ab
+   *  Sturzrate < 0.05, Boden 0.15) klebte das Tempo am Minimum, sobald Stöße/
+   *  Reset-Rauschen die Sturzrate bei ~0.3 hielten: Die Policy lernte Stehen
+   *  mit Mini-Schritten statt sichtbares Laufen. Jetzt: Boden 0.35, Aufstieg
+   *  ab Sturzrate < 0.12, Abbau erst ab > 0.45. */
   private curriculumStep(): void {
     if (!this.runCfg.curriculum) return;
-    if (this.lastFellRate > 0.3) {
-      this.speedScale = Math.max(0.15, this.speedScale * 0.8);
-    } else if (this.lastFellRate < 0.05) {
-      this.speedScale = Math.min(1, this.speedScale * 1.08 + 0.02);
+    if (this.lastFellRate > 0.45) {
+      this.speedScale = Math.max(0.35, this.speedScale * 0.85);
+    } else if (this.lastFellRate < 0.12) {
+      this.speedScale = Math.min(1, this.speedScale * 1.1 + 0.03);
     }
   }
 

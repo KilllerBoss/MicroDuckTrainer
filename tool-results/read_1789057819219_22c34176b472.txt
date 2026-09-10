@@ -1,0 +1,810 @@
+     1→     1→// ── MicroDuck Trainer v2.0 – Evolution Strategy (OpenAI-ES) ──────────────────
+     2→     2→// Antithetic Sampling, Rank-Normalisierung, adaptives Sigma. Evaluierung läuft
+     3→     3→// bevorzugt in Web-Workern (headless, reine Physik) – Fallback: Main-Thread-
+     4→     4→// Interleaving (mehrere MjData-Instanzen rundenweise, N = Turbo-Stufe).
+     5→     5→// Die laufende Entscheidung steht im Worklog (public/workers/es-worker.js).
+     6→     6→
+     7→     7→import type { ModelMeta, ModelId } from "./models";
+     8→     8→import { getModel } from "./models";
+     9→     9→import { Engine } from "./engine";
+    10→    10→import { MlpPolicy, hiddenList, type MlpLayout } from "./policy";
+    11→    11→import type { RewardConfig } from "./rewards";
+    12→    12→import type { WorldBuild } from "./worldgen";
+    13→    13→import { getCustomFn, evalCustomFn, type CustomRewardFn } from "./customcode";
+    14→    14→
+    15→    15→/** Imitations-Daten für Rollouts (Main-Thread + Worker, identisch). */
+    16→    16→export interface ImitEvalData {
+    17→    17→  dim: number;
+    18→    18→  frames: number;
+    19→    19→  fps: number;
+    20→    20→  duration: number;
+    21→    21→  targets: Float32Array; // frames × dim (RELATIV zur Ruhelage, v2.3)
+    22→    22→  rootY: Float32Array; // frames (GLB y-up)
+    23→    23→  baseY: number;
+    24→    24→  // v2.3: Cross-Species-Retargeting (Ente lernt Human-Clips)
+    25→    25→  /** Zentrum-Pose (Ente: defaultPose, G1: standPose) – wird zu den relativen
+    26→    26→   *  Clip-Zielen addiert, damit die Zielpose im Stehen exakt die Standpose ist. */
+    27→    27→  center?: Float32Array;
+    28→    28→  /** Wurzel-Höhen-Skalierung (Roboterhöhe / Clip-Wurzelhöhe), default 1. */
+    29→    29→  scaleY?: number;
+    30→    30→}
+    31→    31→
+    32→    32→/** Zielpose + Wurzel-Delta zum Zeitpunkt t (loop). Schreibt in out (ABSOLUT). */
+    33→    33→export function imitSampleAt(d: ImitEvalData, t: number, out: Float32Array): number {
+    34→    34→  const tt = d.duration > 0 ? ((t % d.duration) + d.duration) % d.duration : 0;
+    35→    35→  const x = tt * d.fps;
+    36→    36→  const f0 = Math.min(d.frames - 1, Math.floor(x));
+    37→    37→  const f1 = Math.min(d.frames - 1, f0 + 1);
+    38→    38→  const u = x - f0;
+    39→    39→  const c = d.center;
+    40→    40→  for (let j = 0; j < d.dim; j++) {
+    41→    41→    const a = d.targets[f0 * d.dim + j];
+    42→    42→    const b = d.targets[f1 * d.dim + j];
+    43→    43→    out[j] = (a + (b - a) * u) + (c ? c[j] : 0);
+    44→    44→  }
+    45→    45→  const raw = (d.rootY[f0] + (d.rootY[f1] - d.rootY[f0]) * u) - d.baseY;
+    46→    46→  return raw * (d.scaleY ?? 1);
+    47→    47→}
+    48→    48→
+    49→    49→/**
+    50→    50→ * v2.3: Profi-Trainings-Konfiguration (Professional-Tricks, an/aus + Werte).
+    51→    51→ * Identisch an Main-Thread-Rollouts und ES-Worker übergeben.
+    52→    52→ */
+    53→    53→export interface RunCfg {
+    54→    54→  /** Befehle (cmd) pro Rollout zufällig ziehen + Tracking-Reward → Joystick-fähige Policies. */
+    55→    55→  cmdTrain: boolean;
+    56→    56→  cmdFwd: number; // max Vorwärtstempo der Befehle (m/s)
+    57→    57→  cmdLat: number; // max Seitwärtstempo (m/s)
+    58→    58→  cmdAng: number; // max Gierrate (rad/s)
+    59→    59→  /** Curriculum: Befehls-Tempo automatisch an die Sturzrate anpassen. */
+    60→    60→  curriculum: boolean;
+    61→    61→  /** Action-Lowpass: 1 = aus, sonst EMA-Alpha (0.3–0.9). Gegen Zittern. */
+    62→    62→  actionSmooth: number;
+    63→    63→  /** Zufalls-Stöße auf den Basis-Körper (Domain-Randomization). */
+    64→    64→  pushes: boolean;
+    65→    65→  /** Reset mit kleinem Zustands-Rauschen (Reference-State-Init). */
+    66→    66→  noiseReset: boolean;
+    67→    67→  /** Fitness = Summe (Überleben zählt) oder Mittelwert (klassisch). */
+    68→    68→  fitnessMode: "sum" | "mean";
+    69→    69→  /** Gewichtsbremse (theta-Decay gegen saturierte tanh-Ausgänge), 0 = aus. */
+    70→    70→  weightDecay: number;
+    71→    71→}
+    72→    72→
+    73→    73→export function defaultRunCfg(): RunCfg {
+    74→    74→  return {
+    75→    75→    cmdTrain: true, cmdFwd: 0.25, cmdLat: 0.15, cmdAng: 0.8,
+    76→    76→    curriculum: true, actionSmooth: 0.6, pushes: true, noiseReset: true,
+    77→    77→    fitnessMode: "sum", weightDecay: 0.02,
+    78→    78→  };
+    79→    79→}
+    80→    80→
+    81→    81→export type TurboLevel = 1 | 4 | 16 | 32 | 64;
+    82→    82→
+    83→    83→export const TURBO_LEVELS: TurboLevel[] = [1, 4, 16, 32, 64];
+    84→    84→
+    85→    85→export function popSizeFor(turbo: TurboLevel): number {
+    86→    86→  switch (turbo) {
+    87→    87→    case 1: return 24;
+    88→    88→    case 4: return 32;
+    89→    89→    case 16: return 48;
+    90→    90→    case 32: return 64;
+    91→    91→    case 64: return 96;
+    92→    92→  }
+    93→    93→}
+    94→    94→
+    95→    95→export interface EsStats {
+    96→    96→  generation: number;
+    97→    97→  bestFitness: number;
+    98→    98→  bestEver: number;
+    99→    99→  sigma: number;
+   100→   100→  stepsPerSec: number;
+   101→   101→  history: number[]; // beste Fitness je Generation
+   102→   102→  meanFitness: number;
+   103→   103→  fellRate: number;
+   104→   104→  evaluator: "worker" | "main";
+   105→   105→  workersReady: number;
+   106→   106→  speedScale: number; // v2.3: Curriculum-Tempo-Stufe
+   107→   107→}
+   108→   108→
+   109→   109→const BASE_SIGMA = 0.08;
+   110→   110→const LR = 0.03;
+   111→   111→const STAGNATION_GENS = 8;
+   112→   112→
+   113→   113→/** v2.3: Layer-Dimensionen eines Layouts ([obs, ...hidden, action]). */
+   114→   114→export function layerDims(layout: MlpLayout): number[] {
+   115→   115→  const hs = hiddenList(layout.hidden);
+   116→   116→  return [layout.obsDim, ...hs, layout.actionDim];
+   117→   117→}
+   118→   118→
+   119→   119→// ── Rollout-Kontext (kooperativ schrittweise, für Interleaving) ──────────────
+   120→   120→
+   121→   121→interface RolloutCtx {
+   122→   122→  data: any; // eigenes MjData
+   123→   123→  mlp: MlpPolicy;
+   124→   124→  steps: number;
+   125→   125→  n: number;
+   126→   126→  t: number; // Imitations-Zeit (s)
+   127→   127→  sum: number;
+   128→   128→  fell: boolean;
+   129→   129→  done: boolean;
+   130→   130→  prevAct: Float32Array;
+   131→   131→  act: Float32Array;
+   132→   132→  actF: Float32Array; // v2.3: tiefpassgefilterte Aktion (Action-Lowpass)
+   133→   133→  pushTick: number; // v2.3: Schritt-Zähler für Zufalls-Stöße
+   134→   134→}
+   135→   135→
+   136→   136→function resetCtx(
+   137→   137→  engine: Engine, ctx: RolloutCtx, run: RunCfg,
+   138→   138→  cmd: Float32Array | null,
+   139→   139→) {
+   140→   140→  engine.setData(ctx.data);
+   141→   141→  engine.resetToKeyframe();
+   142→   142→  engine.trackCmd = false;
+   143→   143→  if (run.noiseReset) engine.addResetNoise();
+   144→   144→  engine.cmd.fill(0);
+   145→   145→  if (cmd) engine.cmd.set(cmd); // v2.3: Befehl des Paares (Domain-Randomization)
+   146→   146→  engine.trackCmd = run.cmdTrain && !!cmd;
+   147→   147→  ctx.n = 0;
+   148→   148→  ctx.t = 0;
+   149→   149→  ctx.sum = 0;
+   150→   150→  ctx.fell = false;
+   151→   151→  ctx.done = false;
+   152→   152→  ctx.prevAct.fill(0);
+   153→   153→  ctx.actF.fill(0);
+   154→   154→  ctx.pushTick = 0;
+   155→   155→}
+   156→   156→
+   157→   157→/** Zusatz-Info für den Custom-Code-Term (Zeit/Schritt). */
+   158→   158→export interface StepCtxInfo { t: number; step: number; dt: number }
+   159→   159→
+   160→   160→/**
+   161→   161→ * Reward-Terme für EINEN Policy-Step (Zustand NACH dem Physik-Step).
+   162→   162→ * Geteilt zwischen Rollouts (ES) und Test-Modus (kumulierter Reward).
+   163→   163→ */
+   164→   164→export function stepRewardValue(
+   165→   165→  engine: Engine, cfg: RewardConfig, act: Float32Array, prevAct: Float32Array,
+   166→   166→  ctxInfo?: StepCtxInfo,
+   167→   167→): number {
+   168→   168→  const T = cfg.terms;
+   169→   169→  const gz = engine.projGravZ();
+   170→   170→  const upZ = Math.max(0, Math.min(1, -gz));
+   171→   171→  const h = engine.height();
+   172→   172→  const yaw = engine.yaw();
+   173→   173→  const qvel = engine.data.qvel as Float32Array;
+   174→   174→  const vx = Math.cos(yaw) * qvel[0] + Math.sin(yaw) * qvel[1];
+   175→   175→  const vy = -Math.sin(yaw) * qvel[0] + Math.cos(yaw) * qvel[1];
+   176→   176→  const omega = qvel[5];
+   177→   177→  // v2.3: Befehls-Tracking (Profi-Stil MJX-Playground): Vorwärts/Seitwärts-Term
+   178→   178→  // folgt dem aktiven Befehl (Training: zufällig gezogen, Test: Joystick) mit
+   179→   179→  // exp(-Fehler²/σ²) statt fester Linear-Skala.
+   180→   180→  const tracking = engine.trackCmd === true;
+   181→   181→  const cmd0 = engine.cmd[0] ?? 0;
+   182→   182→  const cmd1 = engine.cmd[1] ?? 0;
+   183→   183→  let val = 0;
+   184→   184→  if (T.upright?.enabled) val += T.upright.weight * upZ;
+   185→   185→  if (T.height?.enabled) {
+   186→   186→    val += T.height.weight * (1 - Math.abs(h - T.height.param) / Math.max(0.05, T.height.param));
+   187→   187→  }
+   188→   188→  if (T.forward?.enabled) {
+   189→   189→    if (tracking) {
+   190→   190→      const dvx = vx - cmd0, dvy = vy - cmd1;
+   191→   191→      val += T.forward.weight * Math.exp(-(dvx * dvx + dvy * dvy) / 0.25);
+   192→   192→    } else {
+   193→   193→      val += T.forward.weight * Math.max(0, 1 - Math.abs(vx - T.forward.param) / 0.5);
+   194→   194→    }
+   195→   195→  }
+   196→   196→  if (T.lateral?.enabled) {
+   197→   197→    if (tracking) {
+   198→   198→      const dvy = vy - cmd1;
+   199→   199→      val += T.lateral.weight * Math.exp(-(dvy * dvy) / 0.25);
+   200→   200→    } else {
+   201→   201→      val += T.lateral.weight * Math.max(-1, Math.min(1, vy));
+   202→   202→    }
+   203→   203→  }
+   204→   204→  if (T.yaw?.enabled) val += T.yaw.weight * (1 - Math.min(1, Math.abs(omega - (engine.cmd[2] ?? 0))));
+   205→   205→  if (T.alive?.enabled) val += T.alive.weight;
+   206→   206→  if (T.energy?.enabled) {
+   207→   207→    let e = 0;
+   208→   208→    for (let j = 0; j < act.length; j++) e += act[j] * act[j];
+   209→   209→    val -= T.energy.weight * (e / act.length);
+   210→   210→  }
+   211→   211→  if (T.smoothness?.enabled) {
+   212→   212→    let d = 0;
+   213→   213→    for (let j = 0; j < act.length; j++) {
+   214→   214→      const diff = act[j] - prevAct[j];
+   215→   215→      d += diff * diff;
+   216→   216→    }
+   217→   217→    val -= T.smoothness.weight * (d / act.length);
+   218→   218→  }
+   219→   219→  if (T.jointAccel?.enabled) {
+   220→   220→    const qacc = engine.jointAccel();
+   221→   221→    let s = 0;
+   222→   222→    for (const a of qacc) s += Math.abs(a);
+   223→   223→    val -= T.jointAccel.weight * (s / qacc.length / 1000);
+   224→   224→  }
+   225→   225→  if (T.contact?.enabled) {
+   226→   226→    const qacc = engine.data.qacc as Float32Array;
+   227→   227→    let s = 0;
+   228→   228→    for (let j = 0; j < 6; j++) s += Math.abs(qacc[j]);
+   229→   229→    val -= T.contact.weight * (s / 6 / 1000);
+   230→   230→  }
+   231→   231→  if (T.jointLimit?.enabled) {
+   232→   232→    const angles = engine.jointAngles();
+   233→   233→    const ranges = engine.jntRanges;
+   234→   234→    let pen = 0, cnt = 0;
+   235→   235→    for (let j = 0; j < angles.length; j++) {
+   236→   236→      const [lo, hi] = ranges[j] ?? [0, 0];
+   237→   237→      const lim = Math.max(Math.abs(lo), Math.abs(hi));
+   238→   238→      if (lim < 1e-6) continue;
+   239→   239→      cnt++;
+   240→   240→      const over = Math.max(0, (Math.abs(angles[j]) - 0.9 * lim) / (0.1 * lim));
+   241→   241→      pen += Math.min(1, over);
+   242→   242→    }
+   243→   243→    if (cnt > 0) val -= T.jointLimit.weight * (pen / cnt);
+   244→   244→  }
+   245→   245→  // ── v2.1: Imitation ──
+   246→   246→  if (T.imitate?.enabled && engine.imitTarget) {
+   247→   247→    const angles = engine.jointAngles();
+   248→   248→    const tgt = engine.imitTarget;
+   249→   249→    let err = 0;
+   250→   250→    for (let j = 0; j < angles.length; j++) err += Math.abs(angles[j] - tgt[j]);
+   251→   251→    err /= Math.max(1, angles.length);
+   252→   252→    val += T.imitate.weight * Math.max(0, 1 - err / Math.max(0.05, T.imitate.param));
+   253→   253→  }
+   254→   254→  if (T.imitHeight?.enabled && engine.imitRootDelta !== null) {
+   255→   255→    const zt = engine.meta.targetHeight + engine.imitRootDelta;
+   256→   256→    val -= T.imitHeight.weight
+   257→   257→      * Math.min(1, Math.abs(engine.height() - zt) / Math.max(0.05, T.imitHeight.param));
+   258→   258→  }
+   259→   259→  // ── v2.1: Punkt-Modus ──
+   260→   260→  if ((T.pointChase?.enabled || T.pointAvoid?.enabled) && engine.targetPoint) {
+   261→   261→    const [tx, ty] = engine.targetPoint;
+   262→   262→    const p = engine.torsoPos();
+   263→   263→    const d = Math.hypot(p[0] - tx, p[1] - ty);
+   264→   264→    if (T.pointChase?.enabled) {
+   265→   265→      val += T.pointChase.weight * Math.max(0, 1 - d / Math.max(0.05, T.pointChase.param));
+   266→   266→    }
+   267→   267→    if (T.pointAvoid?.enabled) {
+   268→   268→      val += T.pointAvoid.weight * Math.min(1, d / Math.max(0.05, T.pointAvoid.param));
+   269→   269→    }
+   270→   270→  }
+   271→   271→  // ── v2.2: KI-Code-Term (Gemini-geschriebener Funktionskörper) ──
+   272→   272→  const C = cfg.custom;
+   273→   273→  if (C?.enabled && C.code) {
+   274→   274→    const fn: CustomRewardFn | null = getCustomFn(C.code);
+   275→   275→    if (fn) {
+   276→   276→      const qvel2 = engine.data.qvel as Float32Array;
+   277→   277→      const meta2 = engine.meta;
+   278→   278→      val += C.weight * evalCustomFn(fn, {
+   279→   279→        h: h, height: h,
+   280→   280→        upZ, gz,
+   281→   281→        vx, vy, vz: qvel2[2] ?? 0, omega,
+   282→   282→        angles: engine.jointAngles(),
+   283→   283→        act, prevAct,
+   284→   284→        qpos: engine.data.qpos as Float32Array,
+   285→   285→        qvel: qvel2,
+   286→   286→        qacc: engine.data.qacc as Float32Array,
+   287→   287→        torso: engine.torsoPos(),
+   288→   288→        target: engine.targetPoint ? [engine.targetPoint[0], engine.targetPoint[1]] : null,
+   289→   289→        cmd: engine.cmd,
+   290→   290→        imitDelta: engine.imitRootDelta,
+   291→   291→        imitTarget: engine.imitTarget,
+   292→   292→        dt: ctxInfo?.dt ?? (meta2 ? meta2.timestep * meta2.decimation : 0.02),
+   293→   293→        t: ctxInfo?.t ?? 0,
+   294→   294→        step: ctxInfo?.step ?? 0,
+   295→   295→      });
+   296→   296→    }
+   297→   297→  }
+   298→   298→  return val;
+   299→   299→}
+   300→   300→
+   301→   301→/** Genau EINEN Policy-Step des Rollouts (Rundeneinteilung für Interleaving). */
+   302→   302→function ctxStep(
+   303→   303→  engine: Engine, ctx: RolloutCtx, cfg: RewardConfig,
+   304→   304→  imit: ImitEvalData | null, imitBuf: Float32Array | null, policyDt: number,
+   305→   305→  run: RunCfg,
+   306→   306→): void {
+   307→   307→  const T = cfg.terms;
+   308→   308→  engine.setData(ctx.data);
+   309→   309→  if (imit && imitBuf) {
+   310→   310→    const delta = imitSampleAt(imit, ctx.t, imitBuf);
+   311→   311→    // v2.3: Imitations-Ziele auf Aktuator-Range klemmen (Human-Clips haben
+   312→   312→    // größere Amplituden als die Gelenke erlauben)
+   313→   313→    const lims = engine.ctrlLimits;
+   314→   314→    if (lims) {
+   315→   315→      for (let j = 0; j < imitBuf.length; j++) {
+   316→   316→        const lo = lims[j * 2], hi = lims[j * 2 + 1];
+   317→   317→        if (hi > lo) imitBuf[j] = Math.min(hi, Math.max(lo, imitBuf[j]));
+   318→   318→      }
+   319→   319→    }
+   320→   320→    engine.imitTarget = imitBuf;
+   321→   321→    engine.imitRootDelta = delta;
+   322→   322→    const ph = (imit.duration > 0 ? (ctx.t % imit.duration) / imit.duration : 0) * 2 * Math.PI;
+   323→   323→    engine.imitPhase = [Math.sin(ph), Math.cos(ph)];
+   324→   324→  }
+   325→   325→  const obs = engine.obsFor(!!imit);
+   326→   326→  ctx.mlp.forward(obs, ctx.act);
+   327→   327→  // v2.3: Action-Lowpass (Profi-Trick gegen Zittern): gefilterte Aktion
+   328→   328→  // steuert Physik UND Obs; Smoothness vergleicht die gefilterten Werte.
+   329→   329→  const a = run.actionSmooth;
+   330→   330→  if (a < 0.999) {
+   331→   331→    for (let j = 0; j < ctx.act.length; j++) {
+   332→   332→      ctx.actF[j] = a * ctx.act[j] + (1 - a) * ctx.actF[j];
+   333→   333→    }
+   334→   334→  } else {
+   335→   335→    ctx.actF.set(ctx.act);
+   336→   336→  }
+   337→   337→  engine.lastAction.set(ctx.actF);
+   338→   338→  engine.stepWithAction(ctx.actF);
+   339→   339→  ctx.n++;
+   340→   340→  ctx.t += policyDt;
+   341→   341→
+   342→   342→  // v2.3: Zufalls-Stöße (Domain-Randomization, Profi-Trick für Robustheit)
+   343→   343→  if (run.pushes && ++ctx.pushTick >= 55) {
+   344→   344→    ctx.pushTick = 0;
+   345→   345→    engine.applyPush();
+   346→   346→  }
+   347→   347→
+   348→   348→  ctx.sum += stepRewardValue(
+   349→   349→    engine, cfg, ctx.actF, ctx.prevAct, { t: ctx.t, step: ctx.n, dt: policyDt },
+   350→   350→  );
+   351→   351→  ctx.prevAct.set(ctx.actF);
+   352→   352→
+   353→   353→  if (engine.isFallen()) {
+   354→   354→    ctx.fell = true;
+   355→   355→    ctx.done = true;
+   356→   356→    if (T.fall?.enabled) {
+   357→   357→      // v2.3: Summen-Modus → FLACHE Strafe (Ranking steigt stetig mit der
+   358→   358→      // Überlebensdauer); Mittel-Modus → ×n (pro-step-Beitrag wie bisher).
+   359→   359→      ctx.sum -= run.fitnessMode === "sum"
+   360→   360→        ? T.fall.weight
+   361→   361→        : T.fall.weight * ctx.n;
+   362→   362→    }
+   363→   363→  } else if (ctx.n >= ctx.steps) {
+   364→   364→    ctx.done = true;
+   365→   365→  }
+   366→   366→}
+   367→   367→
+   368→   368→function finishCtx(ctx: RolloutCtx, mode: "sum" | "mean"): number {
+   369→   369→  // v2.3: Summen-Modus (Profi-Trick): länger überleben = mehr Reward-Akkumulation
+   370→   370→  // → natürlicher Überlebensdruck; Mittelwert macht Sturzzeitpunkt egal.
+   371→   371→  return mode === "sum" ? ctx.sum : (ctx.n > 0 ? ctx.sum / ctx.n : 0);
+   372→   372→}
+   373→   373→
+   374→   374→// ── EsTrainer ────────────────────────────────────────────────────────────────
+   375→   375→
+   376→   376→export class EsTrainer {
+   377→   377→  meta: ModelMeta;
+   378→   378→  modelId: ModelId;
+   379→   379→  engine: Engine; // eigener headless-Kontext (kein Rendering)
+   380→   380→
+   381→   381→  theta: Float32Array;
+   382→   382→  layout: MlpLayout;
+   383→   383→  sigma = BASE_SIGMA;
+   384→   384→  baseSigma = BASE_SIGMA;
+   385→   385→  lr = LR;
+   386→   386→  rolloutSteps = 200;
+   387→   387→  /** v2.2: Training stoppt automatisch nach N Generationen (0 = unbegrenzt). */
+   388→   388→  maxGenerations = 0;
+   389→   389→  turbo: TurboLevel = 1;
+   390→   390→  reward: RewardConfig;
+   391→   391→
+   392→   392→  generation = 0;
+   393→   393→  bestEver = -Infinity;
+   394→   394→  bestTheta: Float32Array;
+   395→   395→  history: number[] = [];
+   396→   396→  lastGenBest = 0;
+   397→   397→  lastGenMean = 0;
+   398→   398→  lastFellRate = 0;
+   399→   399→  stepsPerSec = 0;
+   400→   400→  sinceImprovement = 0;
+   401→   401→  evaluator: "worker" | "main" = "main";
+   402→   402→  workersReady = 0;
+   403→   403→  // v2.1: Welt + Imitation für Rollouts
+   404→   404→  obsExtra = 0;
+   405→   405→  world: WorldBuild | null = null;
+   406→   406→  imit: ImitEvalData | null = null;
+   407→   407→  imitSig = "";
+   408→   408→  obsExtraActive = false; // Phase aktuell in der Obs?
+   409→   409→  // v2.3: Profi-Trainings-Konfiguration + Curriculum-Phase
+   410→   410→  runCfg: RunCfg = defaultRunCfg();
+   411→   411→  speedScale = 0.5; // Curriculum: Befehls-Tempo-Stufe (0.15..1)
+   412→   412→
+   413→   413→  private workers: Worker[] = [];
+   414→   414→  private pending = new Map<number, (r: { fitness: number; fell: boolean; steps: number }) => void>();
+   415→   415→  private jobId = 0;
+   416→   416→  private workerBooted = false;
+   417→   417→  private stepsCounter = 0;
+   418→   418→  // MjData-Pool: Rollout-Instanzen werden wiederverwendet (kein Leak je Generation)
+   419→   419→  private dataPool: any[] = [];
+   420→   420→  private imitBuf: Float32Array | null = null;
+   421→   421→  private policyDt = 0.02;
+   422→   422→
+   423→   423→  constructor(
+   424→   424→    modelId: ModelId, theta: Float32Array, layout: MlpLayout, reward: RewardConfig,
+   425→   425→    opts?: { obsExtra?: number; world?: WorldBuild | null; imit?: ImitEvalData | null; imitSig?: string },
+   426→   426→  ) {
+   427→   427→    this.modelId = modelId;
+   428→   428→    this.meta = getModel(modelId);
+   429→   429→    this.theta = theta.slice();
+   430→   430→    this.layout = layout;
+   431→   431→    this.reward = reward;
+   432→   432→    this.bestTheta = theta.slice();
+   433→   433→    this.obsExtra = opts?.obsExtra ?? 0;
+   434→   434→    this.world = opts?.world ?? null;
+   435→   435→    this.imit = opts?.imit ?? null;
+   436→   436→    this.imitSig = opts?.imitSig ?? "";
+   437→   437→    this.engine = new Engine();
+   438→   438→  }
+   439→   439→
+   440→   440→  async init(): Promise<void> {
+   441→   441→    this.policyDt = this.meta.timestep * this.meta.decimation;
+   442→   442→    await this.engine.load(this.modelId, this.world ?? undefined);
+   443→   443→    this.imitBuf = this.imit ? new Float32Array(this.imit.dim) : null;
+   444→   444→    this.engine.setImitObs(this.obsExtra > 0);
+   445→   445→    this.obsExtraActive = this.obsExtra > 0;
+   446→   446→  }
+   447→   447→
+   448→   448→  /** Versucht, Eval-Worker zu starten (Module-Worker mit import('/wasm/mujoco.js')). */
+   449→   449→  async tryStartWorkers(): Promise<boolean> {
+   450→   450→    if (this.workerBooted) return this.workersReady > 0;
+   451→   451→    try {
+   452→   452→      const count = Math.max(1, Math.min(3, Math.floor((navigator.hardwareConcurrency || 4) / 2)));
+   453→   453→      const payload = await this.buildWorkerPayload();
+   454→   454→      const ready = await Promise.all(
+   455→   455→        Array.from({ length: count }, (_, i) => this.bootWorker(i, payload).catch(() => false)),
+   456→   456→      );
+   457→   457→      this.workersReady = ready.filter(Boolean).length;
+   458→   458→    } catch (err) {
+   459→   459→      console.warn("[es] Worker-Start fehlgeschlagen:", err);
+   460→   460→      this.workersReady = 0;
+   461→   461→    }
+   462→   462→    this.workerBooted = true;
+   463→   463→    this.evaluator = this.workersReady > 0 ? "worker" : "main";
+   464→   464→    return this.workersReady > 0;
+   465→   465→  }
+   466→   466→
+   467→   467→  /** Dieselbe XML-Aufbereitung wie der Engine-Boot (ausgelagert nach xml.ts). */
+   468→   468→  private async buildWorkerPayload(): Promise<WorkerInitPayload> {
+   469→   469→    const src = await (await fetch(this.meta.mjcf)).text();
+   470→   470→    const { buildPhysicsXmlForWorker } = await import("./xml");
+   471→   471→    const base = buildPhysicsXmlForWorker(this.modelId, src, this.meta, this.world ?? null);
+   472→   472→    return {
+   473→   473→      ...base,
+   474→   474→      cmdSize: this.meta.cmdSize,
+   475→   475→      obsType: this.meta.obsType,
+   476→   476→      decimation: this.meta.decimation,
+   477→   477→      actionScale: this.meta.actionScale,
+   478→   478→      defaultPose: this.meta.defaultPose,
+   479→   479→      jointNames: this.meta.jointNames,
+   480→   480→      torsoBody: this.meta.torsoBody,
+   481→   481→      gyroSensor: this.meta.gyroSensor,
+   482→   482→      keyframe: this.meta.keyframe,
+   483→   483→      obsExtra: this.obsExtra,
+   484→   484→      targetHeight: this.meta.targetHeight,
+   485→   485→      imitation: this.imit
+   486→   486→        ? {
+   487→   487→            dim: this.imit.dim, frames: this.imit.frames, fps: this.imit.fps,
+   488→   488→            duration: this.imit.duration, targets: this.imit.targets.buffer,
+   489→   489→            rootY: this.imit.rootY.buffer, baseY: this.imit.baseY,
+   490→   490→            // v2.3: Cross-Species-Retargeting (Center-Pose + Höhen-Skalierung)
+   491→   491→            center: this.imit.center ? this.imit.center.buffer : null,
+   492→   492→            scaleY: this.imit.scaleY ?? 1,
+   493→   493→          }
+   494→   494→        : null,
+   495→   495→    };
+   496→   496→  }
+   497→   497→
+   498→   498→  private async bootWorker(
+   499→   499→    idx: number,
+   500→   500→    payload: WorkerInitPayload,
+   501→   501→  ): Promise<boolean> {
+   502→   502→    const w = new Worker("/workers/es-worker.js", { type: "module" });
+   503→   503→    this.workers.push(w);
+   504→   504→    const ready = await new Promise<boolean>((resolve) => {
+   505→   505→      const to = setTimeout(() => resolve(false), 30000);
+   506→   506→      w.onmessage = (e: MessageEvent) => {
+   507→   507→        const msg = e.data as { type: string; message?: string };
+   508→   508→        if (msg.type === "ready") {
+   509→   509→          clearTimeout(to);
+   510→   510→          resolve(true);
+   511→   511→        } else if (msg.type === "bootError") {
+   512→   512→          console.warn("[es] Worker-Boot fehlgeschlagen:", msg.message);
+   513→   513→          clearTimeout(to);
+   514→   514→          resolve(false);
+   515→   515→        } else if (msg.type === "result") {
+   516→   516→          this.onWorkerResult(e.data as WorkerResultMsg);
+   517→   517→        }
+   518→   518→      };
+   519→   519→      w.onerror = () => {
+   520→   520→        clearTimeout(to);
+   521→   521→        resolve(false);
+   522→   522→      };
+   523→   523→      w.postMessage({ type: "init", workerId: idx, ...payload });
+   524→   524→    });
+   525→   525→    return ready;
+   526→   526→  }
+   527→   527→
+   528→   528→  private onWorkerResult(msg: WorkerResultMsg) {
+   529→   529→    const resolve = this.pending.get(msg.jobId);
+   530→   530→    if (!resolve) return;
+   531→   531→    this.pending.delete(msg.jobId);
+   532→   532→    this.stepsCounter += msg.steps;
+   533→   533→    resolve({ fitness: msg.fitness, fell: msg.fell, steps: msg.steps });
+   534→   534→  }
+   535→   535→
+   536→   536→  private evalViaWorker(
+   537→   537→    theta: Float32Array, cmd: Float32Array | null,
+   538→   538→  ): Promise<{ fitness: number; fell: boolean; steps: number }> {
+   539→   539→    const jobId = ++this.jobId;
+   540→   540→    const w = this.workers[jobId % this.workers.length];
+   541→   541→    const p = new Promise<{ fitness: number; fell: boolean; steps: number }>((resolve) => {
+   542→   542→      this.pending.set(jobId, resolve);
+   543→   543→    });
+   544→   544→    const copy = theta.slice();
+   545→   545→    const cmdCopy = cmd ? cmd.slice() : null;
+   546→   546→    w.postMessage(
+   547→   547→      {
+   548→   548→        type: "eval", jobId,
+   549→   549→        theta: copy.buffer, layout: this.layout, reward: this.reward,
+   550→   550→        rolloutSteps: this.rolloutSteps,
+   551→   551→        targetPoint: this.pointSnapshot ? [...this.pointSnapshot] : null,
+   552→   552→        // v2.3: Profi-Rollout-Konfiguration + Befehl des Paares
+   553→   553→        run: { ...this.runCfg },
+   554→   554→        cmd: cmdCopy ? Array.from(cmdCopy) : null,
+   555→   555→      },
+   556→   556→      [copy.buffer],
+   557→   557→    );
+   558→   558→    return p;
+   559→   559→  }
+   560→   560→
+   561→   561→  /** Aktueller Punkt-Snapshot für Worker-Rewards (Punkt-Modus). */
+   562→   562→  pointSnapshot: [number, number] | null = null;
+   563→   563→  setTargetPoint(p: [number, number] | null): void {
+   564→   564→    this.pointSnapshot = p;
+   565→   565→  }
+   566→   566→
+   567→   567→  /** Evaluierung der Population: Worker-Pool oder Main-Thread-Interleaving. */
+   568→   568→  private async evalBatch(
+   569→   569→    members: Float32Array[], cmds: (Float32Array | null)[],
+   570→   570→  ): Promise<{ fitness: number; fell: boolean }[]> {
+   571→   571→    const results: { fitness: number; fell: boolean }[] = new Array(members.length);
+   572→   572→    this.stepsCounter = 0;
+   573→   573→    if (this.evaluator === "worker" && this.workers.length > 0) {
+   574→   574→      await Promise.all(
+   575→   575→        members.map(async (m, i) => {
+   576→   576→          const r = await this.evalViaWorker(m, cmds[i]);
+   577→   577→          results[i] = r;
+   578→   578→        }),
+   579→   579→      );
+   580→   580→    } else {
+   581→   581→      // Main-Thread-Interleaving: bis zu 6 gepoolte MjData-Instanzen rundenweise
+   582→   582→      // je 1 Policy-Step, nach jedem Rundendurchlauf Yield an den Event-Loop.
+   583→   583→      const slots = Math.min(6, members.length);
+   584→   584→      for (let batch = 0; batch < members.length; batch += slots) {
+   585→   585→        const batchMembers = members.slice(batch, batch + slots);
+   586→   586→        const ctxs: RolloutCtx[] = batchMembers.map((m, k) => {
+   587→   587→          const ctx: RolloutCtx = {
+   588→   588→            data: this.dataPool.pop() ?? this.engine.newData(),
+   589→   589→            mlp: new MlpPolicy(this.layout, m),
+   590→   590→            steps: this.rolloutSteps,
+   591→   591→            n: 0, t: 0, sum: 0, fell: false, done: false,
+   592→   592→            prevAct: new Float32Array(this.layout.actionDim),
+   593→   593→            act: new Float32Array(this.layout.actionDim),
+   594→   594→            actF: new Float32Array(this.layout.actionDim),
+   595→   595→            pushTick: 0,
+   596→   596→          };
+   597→   597→          resetCtx(this.engine, ctx, this.runCfg, cmds[batch + k] ?? null);
+   598→   598→          return ctx;
+   599→   599→        });
+   600→   600→        while (ctxs.some((c) => !c.done)) {
+   601→   601→          for (const ctx of ctxs) {
+   602→   602→            if (!ctx.done) {
+   603→   603→              ctxStep(this.engine, ctx, this.reward, this.imit, this.imitBuf, this.policyDt, this.runCfg);
+   604→   604→            }
+   605→   605→          }
+   606→   606→          await new Promise<void>((r) => setTimeout(r, 0)); // UI-Yield
+   607→   607→        }
+   608→   608→        for (let i = 0; i < ctxs.length; i++) {
+   609→   609→          results[batch + i] = { fitness: finishCtx(ctxs[i], this.runCfg.fitnessMode), fell: ctxs[i].fell };
+   610→   610→          this.stepsCounter += ctxs[i].n;
+   611→   611→          this.dataPool.push(ctxs[i].data); // zurück in den Pool statt GC/Leak
+   612→   612→        }
+   613→   613→      }
+   614→   614→    }
+   615→   615→    return results;
+   616→   616→  }
+   617→   617→
+   618→   618→  setTurbo(turbo: TurboLevel): void {
+   619→   619→    this.turbo = turbo;
+   620→   620→  }
+   621→   621→
+   622→   622→  setReward(cfg: RewardConfig): void {
+   623→   623→    this.reward = cfg;
+   624→   624→  }
+   625→   625→
+   626→   626→  /** v2.3: Profi-Trainings-Konfiguration übernehmen. */
+   627→   627→  setRunCfg(cfg: RunCfg): void {
+   628→   628→    this.runCfg = cfg;
+   629→   629→    if (!cfg.curriculum) this.speedScale = 1;
+   630→   630→  }
+   631→   631→
+   632→   632→  /** v2.3: Befehl für ein antithetisches Paar ziehen (beide Mitglieder gleich,
+   633→   633→   *  sonst vergleicht der Gradient Äpfel mit Birnen). */
+   634→   634→  private sampleCmd(): Float32Array | null {
+   635→   635→    if (!this.runCfg.cmdTrain) return null;
+   636→   636→    const s = this.speedScale;
+   637→   637→    const cmd = new Float32Array(this.meta.cmdSize);
+   638→   638→    // ~75 % vorwärts, sonst leicht rückwärts/stand – repräsentative Mischung
+   639→   639→    const fwd = Math.random() < 0.75 ? Math.random() : Math.random() * 0.35 - 0.35;
+   640→   640→    cmd[0] = this.runCfg.cmdFwd * s * fwd;
+   641→   641→    if (cmd.length > 1) cmd[1] = this.runCfg.cmdLat * (Math.random() * 2 - 1) * 0.6 * s;
+   642→   642→    if (cmd.length > 2) cmd[2] = this.runCfg.cmdAng * (Math.random() * 2 - 1) * 0.7;
+   643→   643→    return cmd;
+   644→   644→  }
+   645→   645→
+   646→   646→  /** v2.3: Curriculum-Schritt nach jeder Generation (Tempo-Treppe). */
+   647→   647→  private curriculumStep(): void {
+   648→   648→    if (!this.runCfg.curriculum) return;
+   649→   649→    if (this.lastFellRate > 0.3) {
+   650→   650→      this.speedScale = Math.max(0.15, this.speedScale * 0.8);
+   651→   651→    } else if (this.lastFellRate < 0.05) {
+   652→   652→      this.speedScale = Math.min(1, this.speedScale * 1.08 + 0.02);
+   653→   653→    }
+   654→   654→  }
+   655→   655→
+   656→   656→  /** Eine ES-Generation: antithetisches Sampling → Evaluierung → Update. */
+   657→   657→  async runGeneration(): Promise<void> {
+   658→   658→    const pop = popSizeFor(this.turbo);
+   659→   659→    const pairs = Math.ceil(pop / 2);
+   660→   660→    const members: Float32Array[] = [];
+   661→   661→    const epsilons: Float32Array[] = [];
+   662→   662→    const cmds: (Float32Array | null)[] = [];
+   663→   663→    // v2.3: FAN-IN-SKALIERUNG (Profi-Trick für große Netze): Störung je Gewicht
+   664→   664→    // wird durch √(fan-in) der Schicht geteilt, sonst ist die Verhaltens-Störung
+   665→   665→    // bei 197k-Gewicht-Netzen (512→256→128) so groß, dass JEDES Mitglied
+   666→   666→    // sofort stürzt (beobachtet: Sturzrate 100 % bei Schritt ~5).
+   667→   667→    const dims = layerDims(this.layout);
+   668→   668→    for (let i = 0; i < pairs; i++) {
+   669→   669→      const eps = new Float32Array(this.theta.length);
+   670→   670→      let off = 0;
+   671→   671→      for (let l = 0; l < dims.length - 1; l++) {
+   672→   672→        const inDim = dims[l], outDim = dims[l + 1];
+   673→   673→        const wScale = this.sigma / Math.sqrt(inDim);
+   674→   674→        const nW = outDim * inDim;
+   675→   675→        for (let j = 0; j < nW; j++) eps[off + j] = gauss() * wScale;
+   676→   676→        off += nW;
+   677→   677→        for (let j = 0; j < outDim; j++) eps[off + j] = gauss() * this.sigma;
+   678→   678→        off += outDim;
+   679→   679→      }
+   680→   680→      epsilons.push(eps);
+   681→   681→      members.push(Float32Array.from(this.theta.map((v, j) => v + eps[j])));
+   682→   682→      members.push(Float32Array.from(this.theta.map((v, j) => v - eps[j])));
+   683→   683→      // v2.3: EIN Befehl pro Paar (fairer Gradientenvergleich)
+   684→   684→      const c = this.sampleCmd();
+   685→   685→      cmds.push(c, c);
+   686→   686→    }
+   687→   687→    const t0 = performance.now();
+   688→   688→    const results = await this.evalBatch(members.slice(0, pop), cmds.slice(0, pop));
+   689→   689→    const dt = Math.max(1, performance.now() - t0);
+   690→   690→    this.stepsPerSec = (this.stepsCounter / dt) * 1000;
+   691→   691→
+   692→   692→    // Rank-Normalisierung (zentriert auf [-0.5, 0.5], Fitness-Shaping)
+   693→   693→    const n = results.length;
+   694→   694→    const order = results.map((_, i) => i).sort((a, b) => results[a].fitness - results[b].fitness);
+   695→   695→    const shaped = new Float32Array(n);
+   696→   696→    order.forEach((memberIdx, rank) => {
+   697→   697→      shaped[memberIdx] = rank / (n - 1) - 0.5;
+   698→   698→    });
+   699→   699→
+   700→   700→    // Gradienten-Update (antithetisch): theta += lr/sigma * Σ_i (s⁺_i − s⁻_i) · eps_i
+   701→   701→    // members[2i] = theta+eps_i, members[2i+1] = theta−eps_i → epsilons hat
+   702→   702→    // nur `pairs` Einträge (v2.0-Bug: Loop lief über n=pop → undefined-Crash).
+   703→   703→    const grad = new Float32Array(this.theta.length);
+   704→   704→    for (let i = 0; i < pairs; i++) {
+   705→   705→      const eps = epsilons[i];
+   706→   706→      const sPlus = shaped[2 * i] ?? 0;
+   707→   707→      const sMinus = shaped[2 * i + 1] ?? 0;
+   708→   708→      const s = sPlus - sMinus;
+   709→   709→      if (s === 0) continue;
+   710→   710→      for (let j = 0; j < grad.length; j++) grad[j] += s * eps[j];
+   711→   711→    }
+   712→   712→    const norm = this.lr / this.sigma;
+   713→   713→    const wd = this.runCfg.weightDecay;
+   714→   714→    for (let j = 0; j < this.theta.length; j++) {
+   715→   715→      // v2.3: Gewichtsbremse (Decay gegen saturierte tanh → weniger Zittern)
+   716→   716→      this.theta[j] = this.theta[j] * (1 - this.lr * wd) + grad[j] * norm;
+   717→   717→    }
+   718→   718→
+   719→   719→    const bestIdx = order[n - 1];
+   720→   720→    const bestFit = results[bestIdx].fitness;
+   721→   721→    const meanFit = results.reduce((s, r) => s + r.fitness, 0) / n;
+   722→   722→    this.generation++;
+   723→   723→    this.lastGenBest = bestFit;
+   724→   724→    this.lastGenMean = meanFit;
+   725→   725→    this.lastFellRate = results.filter((r) => r.fell).length / n;
+   726→   726→    this.history.push(bestFit);
+   727→   727→    if (this.history.length > 200) this.history.shift();
+   728→   728→
+   729→   729→    if (bestFit > this.bestEver) {
+   730→   730→      this.bestEver = bestFit;
+   731→   731→      this.bestTheta = members[bestIdx].slice();
+   732→   732→      this.sinceImprovement = 0;
+   733→   733→      this.sigma += (this.baseSigma - this.sigma) * 0.2; // Richtung Basis zurück
+   734→   734→    } else {
+   735→   735→      this.sinceImprovement++;
+   736→   736→      if (this.sinceImprovement >= STAGNATION_GENS && this.sigma > 0.01) {
+   737→   737→        this.sigma = Math.max(0.005, this.sigma * 0.85); // adaptiv schrumpfen
+   738→   738→      }
+   739→   739→    }
+   740→   740→    // v2.3: Anker-Restart (Profi-Trick): driftet theta während der Exploration
+   741→   741→    // in eine schlechte Region (hohe Sturzrate trotz geschrumpftem Sigma),
+   742→   742→    // kehrt es zum besten je gefundenen Punkt zurück und versucht neu.
+   743→   743→    if (this.sinceImprovement >= STAGNATION_GENS * 3 && this.lastFellRate > 0.5) {
+   744→   744→      this.theta = this.bestTheta.slice();
+   745→   745→      this.sinceImprovement = 0;
+   746→   746→      this.sigma = Math.min(this.baseSigma, this.sigma * 1.5 + 0.005);
+   747→   747→    }
+   748→   748→    this.curriculumStep(); // v2.3: Tempo-Treppe nach jeder Generation
+   749→   749→  }
+   750→   750→
+   751→   751→  stats(): EsStats {
+   752→   752→    return {
+   753→   753→      generation: this.generation,
+   754→   754→      bestFitness: this.lastGenBest,
+   755→   755→      bestEver: this.bestEver,
+   756→   756→      sigma: this.sigma,
+   757→   757→      stepsPerSec: this.stepsPerSec,
+   758→   758→      history: this.history,
+   759→   759→      meanFitness: this.lastGenMean,
+   760→   760→      fellRate: this.lastFellRate,
+   761→   761→      evaluator: this.evaluator,
+   762→   762→      workersReady: this.workersReady,
+   763→   763→      speedScale: this.speedScale,
+   764→   764→    };
+   765→   765→  }
+   766→   766→
+   767→   767→  dispose(): void {
+   768→   768→    for (const w of this.workers) w.terminate();
+   769→   769→    this.workers = [];
+   770→   770→    for (const d of this.dataPool) {
+   771→   771→      try { d?.delete?.(); } catch { /* Emscripten-Handle */ }
+   772→   772→    }
+   773→   773→    this.dataPool = [];
+   774→   774→    this.engine.dispose();
+   775→   775→  }
+   776→   776→}
+   777→   777→
+   778→   778→export interface WorkerInitPayload {
+   779→   779→  xml: string; meshBase: string; vfsPrefix: string; meshFiles: string[];
+   780→   780→  modelId: ModelId; obsDim: number; actionDim: number;
+   781→   781→  cmdSize: number; obsType: string; decimation: number; actionScale: number;
+   782→   782→  defaultPose: number[]; jointNames: string[];
+   783→   783→  torsoBody: string; gyroSensor: string | null; keyframe: string;
+   784→   784→  // v2.1
+   785→   785→  obsExtra: number;
+   786→   786→  targetHeight: number;
+   787→   787→  imitation: {
+   788→   788→    dim: number; frames: number; fps: number; duration: number;
+   789→   789→    targets: ArrayBufferLike; rootY: ArrayBufferLike; baseY: number;
+   790→   790→    center: ArrayBufferLike | null; // v2.3: Zentrum-Pose (absolut)
+   791→   791→    scaleY: number; // v2.3: Wurzel-Höhen-Skalierung
+   792→   792→  } | null;
+   793→   793→}
+   794→   794→
+   795→   795→interface WorkerResultMsg {
+   796→   796→  type: "result";
+   797→   797→  jobId: number;
+   798→   798→  fitness: number;
+   799→   799→  fell: boolean;
+   800→   800→  steps: number;
+   801→   801→}
+   802→   802→
+   803→   803→// Box–Muller für normalverteiltes Rauschen
+   804→   804→function gauss(): number {
+   805→   805→  let u = 0, v = 0;
+   806→   806→  while (u === 0) u = Math.random();
+   807→   807→  while (v === 0) v = Math.random();
+   808→   808→  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+   809→   809→}
+   810→   810→
