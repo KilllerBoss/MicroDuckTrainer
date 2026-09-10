@@ -6,7 +6,8 @@
 import { Engine } from "./engine";
 import {
   createWorld, mountRig, syncDuck, syncG1, syncBall,
-  type World,
+  syncDuckRig, syncG1Rig, cloneDuckRig, cloneG1Rig,
+  type World, type DuckRig, type G1Rig,
 } from "./rig";
 import { OnnxPolicy, MlpPolicy, warmStartMlp, type MlpLayout } from "./policy";
 import { getModel, type ModelId } from "./models";
@@ -126,6 +127,31 @@ export interface Telemetry {
   imitation: {
     name: string; duration: number; playing: boolean; time: number; mapped: number; manual: boolean;
   } | null;
+  // v2.7: Gruppen-Training (sichtbare Explorations-Kandidaten)
+  groupShow: boolean;
+  ghosts: number; // aktive Kandidaten (0 = pausiert/aus)
+  ghostPaused: boolean;
+}
+
+/** v2.7: Sichtbarer Explorations-Kandidat (Gruppen-Training). */
+interface GhostCtx {
+  data: any; // eigenes MjData
+  mlp: MlpPolicy;
+  prevAct: Float32Array;
+  actSm: Float32Array;
+  actBuf: Float32Array;
+  cmd: [number, number, number];
+  steps: number;
+  t: number;
+  rig: DuckRig | G1Rig | null;
+}
+
+/** Standardnormalverteilt (Box-Muller) für Ghost-Thetas. */
+function gaussLocal(): number {
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
 
 // Enten-Tempos wie reference/constants.js
@@ -196,6 +222,16 @@ export class TrainerCore {
   /** v2.3: Wie lange der Joystick schon losgelassen ist (s) – Punkt fährt heim. */
   private joyIdle = 0;
   private esObsExtra = 0; // Obs-Extra der aktuellen esView
+
+  // v2.7: Gruppen-Training – sichtbare Explorations-Kandidaten (±σ um den
+  // Mittelstand), simuliert wie im Training (eigenes MjData je Kandidat,
+  // Zufalls-Befehl je Runde, Reset bei Sturz/Rundenende).
+  private groupShow = true;
+  private ghosts: GhostCtx[] = [];
+  private ghostRigs: { node: any; rig: DuckRig | G1Rig | null }[] = [];
+  private ghostGen = -1; // Generation, für die die Thetas gezogen wurden
+  private ghostPaused = false; // Gerät zu ausgelastet → Gruppe pausiert
+  private ghostSlow = 0; // Zähler für Auto-Pause
 
   // Posen-Blending
   private g1Base: Float32Array | null = null;
@@ -299,7 +335,10 @@ export class TrainerCore {
       try {
         const pv = localStorage.getItem("mdt_v2_preview");
         if (pv !== null) this.trainPreview = pv === "1";
+        const gs = localStorage.getItem("mdt_v2_group");
+        if (gs !== null) this.groupShow = gs === "1";
       } catch { /* ignore */ }
+      this.disposeGhosts(); // Rigs/Daten des alten Modells verwerfen
       this.testUptime = 0;
       this.testReward = 0;
       this.testStepN = 0;
@@ -732,6 +771,8 @@ export class TrainerCore {
       this.updateEsView();
       this.source = "es";
       this.trainingActive = true;
+      this.ghostPaused = false; // v2.7: neue Session → Gruppe erneut versuchen
+      this.ghostSlow = 0;
       this.emit();
       await this.trainer.tryStartWorkers();
       if (!this.trainingActive) return; // inzwischen gestoppt
@@ -802,6 +843,148 @@ export class TrainerCore {
     this.trainPreview = on;
     try { localStorage.setItem("mdt_v2_preview", on ? "1" : "0"); } catch { /* ignore */ }
     this.emit();
+  }
+
+  // ── v2.7: Gruppen-Training – sichtbare Explorations-Kandidaten ────────────
+
+  /** Gruppen-Training ein/aus (persistiert global). */
+  setGroupShow(on: boolean): void {
+    this.groupShow = on;
+    this.ghostPaused = false;
+    this.ghostSlow = 0;
+    try { localStorage.setItem("mdt_v2_group", on ? "1" : "0"); } catch { /* ignore */ }
+    if (!on) this.disposeGhosts();
+    this.emit();
+  }
+
+  /** Alle Ghost-Rigs/Daten verwerfen (Modellwechsel, Toggle aus, Pause). */
+  private disposeGhosts(): void {
+    for (const g of this.ghostRigs) {
+      try { (g.node as any)?.removeFromParent?.(); } catch { /* ignore */ }
+    }
+    this.ghostRigs = [];
+    this.ghosts = [];
+    this.ghostGen = -1;
+  }
+
+  /** Kandidaten für die aktuelle Generation ziehen: ±1σ um trainer.theta
+   *  (antithetisch – genau wie die echten ES-Mitglieder im Worker). */
+  private resampleGhosts(): void {
+    const trainer = this.trainer;
+    const engine = this.engine;
+    if (!trainer || !engine.data || !engine.meta || !this.world) return;
+    const isDuck = engine.meta.id === "microduck";
+    const srcRig: DuckRig | G1Rig | null = isDuck ? this.world.duckRig : this.world.g1Rig;
+    if (!srcRig) return;
+    this.ghostGen = trainer.generation;
+    const K = 2;
+    const signs = [1, -1]; // antithetisch
+    for (let k = 0; k < K; k++) {
+      let g = this.ghosts[k];
+      if (!g) {
+        g = {
+          data: engine.newData(),
+          mlp: null as unknown as MlpPolicy,
+          prevAct: new Float32Array(trainer.layout.actionDim),
+          actSm: new Float32Array(trainer.layout.actionDim),
+          actBuf: new Float32Array(trainer.layout.actionDim),
+          cmd: [0, 0, 0], steps: 0, t: 0, rig: null,
+        };
+        this.ghosts.push(g);
+      }
+      const theta = trainer.theta.slice();
+      const s = trainer.sigma * signs[k];
+      for (let i = 0; i < theta.length; i++) theta[i] += s * gaussLocal();
+      try { g.mlp = new MlpPolicy(trainer.layout, theta); } catch { return; }
+      if (!g.rig) {
+        const rig: DuckRig | G1Rig | null = isDuck
+          ? cloneDuckRig(srcRig as DuckRig)
+          : cloneG1Rig(srcRig as G1Rig);
+        if (rig) {
+          const node = isDuck ? (rig as DuckRig).placer : (rig as G1Rig).root;
+          // Seitenversatz (three-Z = quer zur Laufrichtung), Kamera folgt dem Helden
+          node.position.set(0, 0, k === 0 ? -1.15 : 1.15);
+          this.world.robotRoot.add(node);
+          this.ghostRigs.push({ node, rig });
+          g.rig = rig;
+        }
+      }
+      this.resetGhost(g, engine.data);
+    }
+  }
+
+  /** Ghost-Rollout zurücksetzen (wie resetCtx im Training: Noise + Zufalls-cmd). */
+  private resetGhost(g: GhostCtx, mainData: any): void {
+    const engine = this.engine;
+    engine.setData(g.data);
+    engine.resetToKeyframe();
+    engine.addResetNoise();
+    engine.cmd.fill(0);
+    // eigener Zufalls-Befehl je Runde (immer über dem Anfahr-Boden)
+    const cap = Math.max(0.1, this.trainCfg.cmdFwd);
+    g.cmd = [
+      Math.max(0.24, cap * (0.55 + Math.random() * 0.35)), 0,
+      (Math.random() * 2 - 1) * 0.2,
+    ];
+    engine.cmd.set(g.cmd);
+    g.steps = 0;
+    g.t = 0;
+    g.prevAct.fill(0);
+    g.actSm.fill(0);
+    engine.setData(mainData);
+  }
+
+  /** Ghosts einen Policy-Step simulieren + auf ihre Klone syncen.
+   *  Telemetrie/Rendering des HEROES bleiben unberührt (Datenkontext wird
+   *  gesichert und zurückgestellt). */
+  private stepGhosts(): void {
+    const engine = this.engine;
+    const trainer = this.trainer;
+    if (!trainer || !engine.data || !engine.meta || !this.world) return;
+    if (this.ghostGen !== trainer.generation || this.ghosts.length === 0) {
+      this.resampleGhosts();
+      if (this.ghosts.length === 0) return;
+    }
+    const mainData = engine.data;
+    const extra = this.esObsExtra >= 2;
+    const dur = this.imitClip?.duration ?? 0;
+    const imitOn = !!(this.imitClip && this.imitPlaying);
+    const smooth = this.trainCfg.actionSmooth;
+    const rollout = Math.max(60, trainer.rolloutSteps);
+    const savedPhase = engine.imitPhase;
+    try {
+      for (const g of this.ghosts) {
+        engine.setData(g.data);
+        if (imitOn) {
+          // Ghost-eigene Imitations-Phase (eigener Rollout-Takt)
+          const ph = dur > 0 ? ((g.t % dur) / dur) * 2 * Math.PI : 0;
+          engine.imitPhase = [Math.sin(ph), Math.cos(ph)];
+        } else {
+          engine.imitPhase = null;
+        }
+        const obs = engine.obsFor(extra);
+        const act = g.mlp.forward(obs, g.actBuf);
+        if (smooth < 0.999) {
+          for (let j = 0; j < g.actSm.length; j++) {
+            g.actSm[j] = smooth * act[j] + (1 - smooth) * g.actSm[j];
+          }
+        } else {
+          g.actSm.set(act);
+        }
+        engine.lastAction.set(g.actSm);
+        engine.stepWithAction(g.actSm);
+        g.steps++;
+        g.t += this.stepMs() / 1000;
+        if (g.rig) {
+          if (engine.meta.id === "microduck") syncDuckRig(g.rig as DuckRig, engine);
+          else syncG1Rig(g.rig as G1Rig, engine, engine.mujoco);
+        }
+        if (g.steps >= rollout || engine.isFallen()) this.resetGhost(g, mainData);
+      }
+    } finally {
+      engine.setData(mainData);
+      engine.imitPhase = imitOn ? savedPhase : null;
+    }
   }
 
   // ── Theta Persistenz ────────────────────────────────────────────────────────
@@ -956,11 +1139,11 @@ export class TrainerCore {
     while (this.running) {
       const t0 = performance.now();
       // v2.5: Tempo-Sync — während des Trainings läuft die sichtbare Welt mit
-      // dem Turbo-Faktor (cap 6×, damit die Darstellung lesbar bleibt). Adaptiv:
-      // Schafft das Gerät die Stufe nicht (Iteration > 1,35× Budget), wird eine
-      // Stufe abgebaut; Trainingsstopp/aus = sofort 1×.
+      // dem Turbo-Faktor (v2.7: Cap 16×). Adaptiv: Schafft das Gerät die Stufe
+      // nicht (Iteration > 1,35× Budget), wird eine Stufe abgebaut;
+      // Trainingsstopp/aus = sofort 1×.
       const target = this.trainPreview && this.trainingActive && this.mode === "test"
-        ? Math.min(6, this.turbo)
+        ? Math.min(16, this.turbo) // v2.7: Cap 6→16 (adaptiv regelt schwache Geräte selbst)
         : 1;
       const stepBudget = this.stepMs();
       if (this.previewSpeed > target) {
@@ -1125,6 +1308,32 @@ export class TrainerCore {
       if (++this.fallDebounce >= 10) this.startRecovery();
     } else if (!this.recovering) {
       this.fallDebounce = 0;
+    }
+
+    // ── v2.7: Gruppen-Training – sichtbare Kandidaten neben dem Helden ──
+    if (
+      this.groupShow && !this.ghostPaused
+      && this.mode === "test" && this.trainPreview && this.trainingActive
+      && this.source === "es" && !this.recovering && this.esView && this.trainer
+    ) {
+      this.stepGhosts();
+      // Auto-Pause: schafft das Gerät die Gruppe nicht (Iteration deutlich
+      // über einer Schritt-Budget bei Tempo 1× → Welt würde langsamer als
+      // Echtzeit), pausiert die Gruppe für diese Sitzung.
+      const budget = this.stepMs();
+      if (this.previewSpeed <= 1 && this.lastIterMs > budget * 1.15) {
+        if (++this.ghostSlow >= 60) {
+          this.ghostPaused = true;
+          this.disposeGhosts();
+          this.onNotice(
+            "Gruppe pausiert",
+            "Das Gerät ist am Limit – die Gruppen-Vorschau wird übersprungen, damit die Welt flott bleibt. Weniger Turbo oder Live-Vorschau-Anpassungen helfen.",
+          );
+          this.emit();
+        }
+      } else {
+        this.ghostSlow = 0;
+      }
     }
 
     if (this.mode === "test") {
@@ -1529,6 +1738,9 @@ export class TrainerCore {
       trainCfg: { ...this.trainCfg },
       trainPreview: this.trainPreview,
       previewSpeed: this.previewSpeed, // v2.5: Sync-Faktor der sichtbaren Physik
+      groupShow: this.groupShow,
+      ghosts: this.groupShow && !this.ghostPaused && this.trainingActive ? this.ghosts.length : 0,
+      ghostPaused: this.ghostPaused,
       customCode: this.rewardCfg?.custom
         ? { name: this.rewardCfg.custom.name, enabled: this.rewardCfg.custom.enabled }
         : null,

@@ -583,7 +583,11 @@ export async function mountRig(
 
 /** Sync Duck: Freejoint-qpos → trunk, Gelenke → setJoint (wie Original syncRig). */
 export function syncDuck(world: World, engine: any): void {
-  const rig = world.duckRig;
+  syncDuckRig(world.duckRig, engine);
+}
+
+/** v2.7: Sync auf ein BELIEBIGES Duck-Rig (auch Gruppen-Klone). */
+export function syncDuckRig(rig: DuckRig | null, engine: any): void {
   if (!rig) return;
   const trunkGroup = rig.bodies.get(engine.meta.torsoBody);
   if (!trunkGroup) return;
@@ -597,7 +601,11 @@ export function syncDuck(world: World, engine: any): void {
 
 /** Sync G1: xpos/xquat je Body direkt auf die Weltgruppen. */
 export function syncG1(world: World, engine: any, mujoco: any): void {
-  const rig = world.g1Rig;
+  syncG1Rig(world.g1Rig, engine, mujoco);
+}
+
+/** v2.7: Sync auf ein BELIEBIGES G1-Rig (auch Gruppen-Klone). */
+export function syncG1Rig(rig: G1Rig | null, engine: any, mujoco: any): void {
   if (!rig) return;
   const model = engine.model;
   const n = model.nbody;
@@ -623,6 +631,48 @@ export function syncG1(world: World, engine: any, mujoco: any): void {
     g.position.set(p[0], p[1], p[2]);
     g.quaternion.set(q[1], q[2], q[3], q[0]);
   }
+}
+
+// ── v2.7: Gruppen-Training – Rig-Klone für sichtbare Kandidaten ─────────────
+
+/** Duck-Rig tief kopieren (Geometrien/Materialien werden geteilt – billig).
+ *  Die Namens-Maps (bodies/joints) werden per Traversal neu aufgebaut. */
+export function cloneDuckRig(src: DuckRig): DuckRig | null {
+  const placer = src.placer.clone(true);
+  const root = placer.children.find((c) => (c as THREE.Object3D).name === src.root.name) as THREE.Group | undefined;
+  if (!root) return null;
+  const bodies = new Map<string, THREE.Group>();
+  placer.traverse((o) => {
+    if ((o as THREE.Object3D).type === "Group" && src.bodies.has(o.name) && !bodies.has(o.name)) {
+      bodies.set(o.name, o as THREE.Group);
+    }
+  });
+  if (bodies.size < src.bodies.size) return null;
+  const joints = new Map<string, DuckJoint>();
+  src.joints.forEach((j, name) => {
+    const g = bodies.get((j.body as THREE.Object3D).name);
+    if (g) joints.set(name, { body: g, axis: j.axis.clone(), baseQuat: g.quaternion.clone(), range: j.range });
+  });
+  if (joints.size !== src.joints.size) return null;
+  return { kind: "duck", placer, root, bodies, joints };
+}
+
+/** G1-Rig tief kopieren (bodyGroups per Name in Original-Reihenfolge). */
+export function cloneG1Rig(src: G1Rig): G1Rig | null {
+  const root = src.root.clone(true);
+  const byName = new Map<string, THREE.Group>();
+  root.traverse((o) => {
+    if ((o as THREE.Object3D).type === "Group" && o.name && !byName.has(o.name)) {
+      byName.set(o.name, o as THREE.Group);
+    }
+  });
+  const bodyGroups: THREE.Group[] = [];
+  for (const g of src.bodyGroups) {
+    const c = byName.get(g.name);
+    if (!c) return null;
+    bodyGroups.push(c);
+  }
+  return { kind: "g1", root, bodyGroups };
 }
 
 export function syncBall(world: World, engine: any): void {

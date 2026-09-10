@@ -30,6 +30,8 @@ interface TrainingPanelProps {
   onImport: () => void;
   // v2.4
   onTrainPreview: (on: boolean) => void;
+  // v2.7
+  onGroupShow: (on: boolean) => void;
 }
 
 function fmt(n: number | undefined | null, digits = 2): string {
@@ -40,7 +42,7 @@ function fmt(n: number | undefined | null, digits = 2): string {
 export default function TrainingPanel(props: TrainingPanelProps) {
   const {
     tel, turbo, onTurbo, onStart, onStop, onShowBest, onSave, onLoad, hasSaved,
-    onTrainCfg, onExport, onImport, onTrainPreview,
+    onTrainCfg, onExport, onImport, onTrainPreview, onGroupShow,
   } = props;
   const es = tel.es;
   const [watchBest, setWatchBest] = useState(false);
@@ -80,19 +82,19 @@ export default function TrainingPanel(props: TrainingPanelProps) {
                   ? "bg-cyan-500/25 text-cyan-200"
                   : "text-slate-400 hover:bg-white/5"
               } ${t === 64 ? "font-bold" : ""}`}
-              title={t === 64 ? "Hyper-Modus (96 Individuen) + 6× Vorschau-Tempo" : `${t}× Turbo – Training UND sichtbare Physik laufen ${Math.min(6, t)}× schneller`}
+              title={t === 64 ? "Hyper-Modus (96 Individuen) + bis 16× Vorschau-Tempo" : `${t}× Turbo – Training UND sichtbare Physik laufen synchron (Gerät-adaptiv, max. 16×)`}
             >
               {t === 64 ? "Hyper" : `${t}×`}
             </button>
           ))}
         </div>
-        {/* v2.5: Tempo-Sync-Anzeige – Vorschau läuft mit dem Trainings-Tempo */}
+        {/* v2.5: Tempo-Sync-Anzeige – tatsächliches synchrones Welt-Tempo */}
         {tel.training && tel.trainPreview && (
           <span
             className="ml-auto rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 font-mono text-[11px] text-emerald-300"
-            title="Die sichtbare Simulation läuft synchron mit dem Trainings-Tempo (max. 6×)"
+            title="Die sichtbare Simulation läuft synchron mit dem Trainings-Tempo (Gerät-adaptiv, max. 16×)"
           >
-            ⏩ Welt: {Math.min(6, turbo)}× sync
+            ⏩ Welt: {tel.previewSpeed}× sync
           </span>
         )}
       </div>
@@ -104,8 +106,8 @@ export default function TrainingPanel(props: TrainingPanelProps) {
           <p className="mt-0.5 text-[10px] leading-snug text-slate-500">
             Der Roboter übt sichtbar mit und wird von Generation zu Generation
             besser. Aus = Training läuft unsichtbar im Hintergrund.
-            {" "}v2.5: Turbo beschleunigt auch die sichtbare Physik — Training und
-            Welt laufen immer synchron (max. 6×, schwache Geräte regeln selbst zurück).
+            {" "}Turbo beschleunigt auch die sichtbare Physik — Training und
+            Welt laufen immer synchron (Gerät-adaptiv, max. 16×).
           </p>
         </div>
         <div className="flex flex-col items-end gap-1">
@@ -114,6 +116,22 @@ export default function TrainingPanel(props: TrainingPanelProps) {
             <span className="font-mono text-[10px] text-emerald-400">{tel.previewSpeed}× Tempo</span>
           )}
         </div>
+      </div>
+
+      {/* v2.7: Gruppen-Training – mehrere Kandidaten trainieren sichtbar */}
+      <div className="flex items-center justify-between gap-3 rounded-lg border border-violet-500/25 bg-violet-500/5 p-3">
+        <div className="min-w-0">
+          <div className="text-xs font-semibold text-violet-200">
+            Gruppen-Training ({tel.ghosts > 0 ? `${tel.ghosts + 1} Roboter` : "nur Held"})
+          </div>
+          <p className="mt-0.5 text-[10px] leading-snug text-slate-500">
+            Zwei weitere Kandidaten (±σ-Exploration, wie im echten Training)
+            üben NEBEN dem Besten sichtbar mit: eigener Zufalls-Befehl je Runde,
+            Reset bei Sturz/Rundenende — so sieht du die ES-Population live.
+            {tel.ghostPaused && " Pausiert: Gerät am Limit (Turbo senken hilft)."}
+          </p>
+        </div>
+        <Switch checked={tel.groupShow} onCheckedChange={onGroupShow} />
       </div>
 
       {/* Status */}

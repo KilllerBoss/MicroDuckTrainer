@@ -67,6 +67,9 @@ const INITIAL_TEL: Telemetry = {
     pushes: true, noiseReset: true, fitnessMode: "sum", weightDecay: 0.02 },
   trainPreview: true,
   previewSpeed: 1,
+  groupShow: true,
+  ghosts: 0,
+  ghostPaused: false,
   customCode: null,
   world: { enabled: false, seed: 0, difficulty: 0.4, density: 0.5,
     features: { treppen: true, huegel: true, loecher: false, hindernisse: true, stange: false } },
@@ -667,6 +670,7 @@ export default function TrainerApp() {
                 onLoad={() => void onLoadTheta()}
                 onTrainCfg={onTrainCfg}
                 onTrainPreview={(on) => core()?.setTrainPreview(on)}
+                onGroupShow={(on) => core()?.setGroupShow(on)}
                 onExport={() => void onExport()}
                 onImport={() => importRef.current?.click()}
               />
