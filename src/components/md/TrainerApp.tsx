@@ -17,12 +17,15 @@ import GamepadOverlay from "./GamepadOverlay";
 import TrainingPanel from "./TrainingPanel";
 import RewardPanel from "./RewardPanel";
 import ControlPanel from "./ControlPanel";
+import WorldPanel from "./WorldPanel";
+import AnimationPanel from "./AnimationPanel";
+import GeminiPanel from "./GeminiPanel";
 import {
   Maximize, Gamepad2, Dumbbell, Star, SlidersHorizontal, RotateCcw,
-  AlertTriangle, Loader2,
+  AlertTriangle, Loader2, Mountain, Film, Bot,
 } from "lucide-react";
 
-type PanelId = "training" | "reward" | "control" | null;
+type PanelId = "training" | "reward" | "control" | "world" | "animation" | "ki" | null;
 
 const MODE_LABELS: Record<string, string> = {
   manuell: "Manuell",
@@ -42,6 +45,11 @@ const INITIAL_TEL: Telemetry = {
   esReady: false, speed: 0, height: 0, ctrlHz: 0, recovering: false, fallen: false,
   testUptime: 0, testReward: 0, training: false, es: null, mappings: [],
   reward: { version: 2, terms: {} },
+  world: { enabled: false, seed: 0, difficulty: 0.4, density: 0.5,
+    features: { treppen: true, huegel: true, loecher: false, hindernisse: true, stange: false } },
+  pointMode: false,
+  point: [0.8, 0],
+  imitation: null,
 };
 
 const emptySubscribe = () => () => {};
@@ -157,6 +165,62 @@ export default function TrainerApp() {
     core()?.setJoystick(x, y);
   }, []);
 
+  // ── v2.1-Callbacks ──
+  const onApplyWorld = useCallback((cfg: Telemetry["world"]) => {
+    void core()?.setWorld(cfg);
+  }, []);
+
+  const onRerollWorld = useCallback(() => {
+    core()?.rerollWorld();
+  }, []);
+
+  const onActivateAnim = useCallback(async (
+    buffer: ArrayBuffer, clipIndex: number, mirror: boolean,
+  ): Promise<{ ok: boolean; message: string }> => {
+    const c = core();
+    const id = c ? (tel.modelId ?? "microduck") : "microduck";
+    if (!c) return { ok: false, message: "App noch nicht bereit." };
+    return c.activateAnimation(buffer, clipIndex, mirror, id);
+  }, [tel.modelId]);
+
+  const onClearAnim = useCallback(() => core()?.clearAnimation(), []);
+  const onPlayingAnim = useCallback((v: boolean) => core()?.setImitPlaying(v), []);
+  const onManualAnim = useCallback((v: boolean) => core()?.setImitManual(v), []);
+
+  const onImitWeight = useCallback((w: number) => {
+    const c = core();
+    const cur = c ? tel.reward : null;
+    if (!c || !cur?.terms.imitate) return;
+    const next = {
+      version: 2 as const,
+      terms: { ...cur.terms, imitate: { ...cur.terms.imitate, weight: w, enabled: w !== 0 } },
+    };
+    c.setReward(next);
+  }, [tel.reward]);
+
+  const onPointMode = useCallback((v: boolean) => core()?.setPointMode(v), []);
+
+  const onGeminiPatch = useCallback((actions: {
+    reward?: Telemetry["reward"];
+    pointMode?: boolean;
+    world?: Partial<Telemetry["world"]>;
+    turbo?: number;
+    resetFirst?: boolean;
+  }) => {
+    const c = core();
+    if (!c) return;
+    if (actions.reward) c.setReward(actions.reward);
+    if (typeof actions.pointMode === "boolean") c.setPointMode(actions.pointMode);
+    if (actions.world) {
+      void c.setWorld({ ...tel.world, ...actions.world,
+        features: { ...tel.world.features, ...(actions.world.features ?? {}) } });
+    }
+    if (actions.resetFirst) {
+      c.resetSim();
+      toast({ title: "Zurückgesetzt", description: "Neues Bewegungsmuster – Training startet bei Gen 0." });
+    }
+  }, [tel.world]);
+
   const onButton = useCallback((source: "joyX" | "joyY" | "A" | "B" | "C" | "D", pressed: boolean) => {
     if (pressed) core()?.pressButton(source);
   }, []);
@@ -236,6 +300,27 @@ export default function TrainerApp() {
             className={`h-9 gap-1 px-2 text-xs sm:px-3 ${panel === "control" ? "bg-cyan-500 text-black hover:bg-cyan-400" : "border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/10"}`}
           >
             <SlidersHorizontal className="h-4 w-4" /> <span className="hidden md:inline">Steuerung</span>
+          </Button>
+          <Button
+            variant={panel === "world" ? "default" : "outline"}
+            onClick={() => openPanel("world")}
+            className={`h-9 gap-1 px-2 text-xs sm:px-3 ${panel === "world" ? "bg-cyan-500 text-black hover:bg-cyan-400" : "border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/10"}`}
+          >
+            <Mountain className="h-4 w-4" /> <span className="hidden md:inline">Welt</span>
+          </Button>
+          <Button
+            variant={panel === "animation" ? "default" : "outline"}
+            onClick={() => openPanel("animation")}
+            className={`h-9 gap-1 px-2 text-xs sm:px-3 ${panel === "animation" ? "bg-cyan-500 text-black hover:bg-cyan-400" : "border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/10"}`}
+          >
+            <Film className="h-4 w-4" /> <span className="hidden md:inline">Animation</span>
+          </Button>
+          <Button
+            variant={panel === "ki" ? "default" : "outline"}
+            onClick={() => openPanel("ki")}
+            className={`h-9 gap-1 px-2 text-xs sm:px-3 ${panel === "ki" ? "bg-fuchsia-500 text-white hover:bg-fuchsia-400" : "border-fuchsia-500/40 text-fuchsia-300 hover:bg-fuchsia-500/10"}`}
+          >
+            <Bot className="h-4 w-4" /> <span className="hidden md:inline">KI</span>
           </Button>
           <Button
             variant="outline"
@@ -327,6 +412,11 @@ export default function TrainerApp() {
           )}
           {tel.recovering && <Chip label="Recovery" value="aktiv" accent />}
           {tel.fallen && !tel.recovering && <Chip label="Sturz" value="erkannt" accent />}
+          {tel.world.enabled && <Chip label="Welt" value="aktiv" />}
+          {tel.pointMode && <Chip label="Punkt" value={`${tel.point[0].toFixed(1)}, ${tel.point[1].toFixed(1)}`} />}
+          {tel.imitation?.playing && (
+            <Chip label="Anim" value={`${tel.imitation.time.toFixed(1)}/${tel.imitation.duration.toFixed(1)}s`} accent />
+          )}
         </div>
       </div>
 
@@ -372,7 +462,10 @@ export default function TrainerApp() {
             <h2 className="text-sm font-semibold text-cyan-300">
               {panel === "training" ? "Training (Evolution Strategy)"
                 : panel === "reward" ? "Bewertung (Reward)"
-                : "Steuerung"}
+                : panel === "control" ? "Steuerung"
+                : panel === "world" ? "Welt (Random-Generator)"
+                : panel === "animation" ? "Animation (GLB-Imitation)"
+                : "KI-Trainingsregeln (Gemini)"}
             </h2>
             <button
               type="button"
@@ -406,7 +499,29 @@ export default function TrainerApp() {
                 onGamepad={setGamepadOn}
                 onAutoRecovery={(v) => { setAutoRecovery(v); core()?.setAutoRecovery(v); }}
                 onMappings={onMappings}
+                onPointMode={onPointMode}
               />
+            )}
+            {panel === "world" && (
+              <WorldPanel tel={tel} onApply={onApplyWorld} onReroll={onRerollWorld} />
+            )}
+            {panel === "animation" && (
+              <AnimationPanel
+                tel={tel}
+                onActivate={onActivateAnim}
+                onClear={onClearAnim}
+                onPlaying={onPlayingAnim}
+                onManual={onManualAnim}
+                onImitWeight={onImitWeight}
+              />
+            )}
+            {panel === "ki" && (
+              <GeminiPanel tel={tel} onApplyPatch={onGeminiPatch} onTurbo={(t) => {
+                const lvl = ([1, 4, 16, 32, 64] as const).includes(t as 1 | 4 | 16 | 32 | 64)
+                  ? (t as 1 | 4 | 16 | 32 | 64) : 1;
+                setTurbo(lvl);
+                core()?.setTurbo(lvl);
+              }} />
             )}
           </div>
         </aside>

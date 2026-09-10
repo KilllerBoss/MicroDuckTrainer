@@ -7,7 +7,7 @@ import { Switch } from "@/components/ui/switch";
 import type { Telemetry } from "@/lib/md/app-core";
 import type { MappingEntry } from "@/lib/md/mapping";
 import MappingEditor from "./MappingEditor";
-import { Gamepad2, ShieldCheck } from "lucide-react";
+import { Gamepad2, ShieldCheck, Crosshair } from "lucide-react";
 
 interface ControlPanelProps {
   tel: Telemetry;
@@ -16,10 +16,11 @@ interface ControlPanelProps {
   onGamepad: (v: boolean) => void;
   onAutoRecovery: (v: boolean) => void;
   onMappings: (m: MappingEntry[]) => void;
+  onPointMode: (v: boolean) => void;
 }
 
 export default function ControlPanel(props: ControlPanelProps) {
-  const { tel, gamepadOn, autoRecovery, onGamepad, onAutoRecovery, onMappings } = props;
+  const { tel, gamepadOn, autoRecovery, onGamepad, onAutoRecovery, onMappings, onPointMode } = props;
   const [showEditor, setShowEditor] = useState(false);
   const modelId = tel.modelId ?? "microduck";
 
@@ -36,6 +37,24 @@ export default function ControlPanel(props: ControlPanelProps) {
           </div>
         </div>
         <Switch checked={gamepadOn} onCheckedChange={onGamepad} aria-label="Gamepad ein/aus" />
+      </div>
+
+      <div className="flex items-center justify-between rounded-lg border border-amber-500/25 bg-black/30 p-3">
+        <div className="flex items-center gap-2.5">
+          <Crosshair className="h-5 w-5 text-amber-300" />
+          <div>
+            <div className="text-sm text-slate-200">Punkt-Modus</div>
+            <div className="text-[11px] text-slate-500">
+              Joystick bewegt einen 3D-Punkt – Reaktion in der Bewertung einstellen
+              („Zum Punkt laufen“ / „Vom Punkt weg“)
+            </div>
+          </div>
+        </div>
+        <Switch
+          checked={tel.pointMode}
+          onCheckedChange={onPointMode}
+          aria-label="Punkt-Modus ein/aus"
+        />
       </div>
 
       <div className="flex items-center justify-between rounded-lg border border-cyan-500/20 bg-black/30 p-3">

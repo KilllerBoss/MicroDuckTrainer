@@ -91,6 +91,30 @@ export const REWARD_TERMS: RewardTermDef[] = [
     defaultWeight: 10, hasParam: false, paramLabel: "", paramMin: 0, paramMax: 20, paramStep: 0.5,
     penalty: true, defaultParam: () => 0,
   },
+  {
+    id: "imitate", label: "Animation imitieren",
+    desc: "Gelenke folgen der hochgeladenen GLB-Animation (Phase in der Beobachtung)",
+    defaultWeight: 0, hasParam: true, paramLabel: "Toleranz (rad)", paramMin: 0.1, paramMax: 1.5, paramStep: 0.05,
+    defaultParam: () => 0.6,
+  },
+  {
+    id: "imitHeight", label: "Animations-Höhe",
+    desc: "Körperhöhe folgt der Wurzelbewegung des Clips (Sprünge/Hocken mitlernen)",
+    defaultWeight: 0, hasParam: true, paramLabel: "Höhen-Fenster (m)", paramMin: 0.05, paramMax: 0.6, paramStep: 0.01,
+    defaultParam: () => 0.2,
+  },
+  {
+    id: "pointChase", label: "Zum Punkt laufen",
+    desc: "Nähe zum Joystick-Punkt wird belohnt (Punkt-Modus)",
+    defaultWeight: 0, hasParam: true, paramLabel: "Nähradius (m)", paramMin: 0.1, paramMax: 2, paramStep: 0.05,
+    defaultParam: () => 0.4,
+  },
+  {
+    id: "pointAvoid", label: "Vom Punkt weg",
+    desc: "Abstand zum Joystick-Punkt wird belohnt (Flüchtlingsverhalten)",
+    defaultWeight: 0, hasParam: true, paramLabel: "Fluchtradius (m)", paramMin: 0.1, paramMax: 2, paramStep: 0.05,
+    defaultParam: () => 1,
+  },
 ];
 
 export const TERM_IDS = new Set(REWARD_TERMS.map((t) => t.id));

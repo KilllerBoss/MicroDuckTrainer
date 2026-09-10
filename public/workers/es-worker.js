@@ -6,10 +6,14 @@
 let mujoco = null;
 let model = null;
 let keyId = -1;
-let ctx = null; // { modelId, obsDim, actionDim, cmdSize, obsType, decimation, actionScale, defaultPose }
+let ctx = null; // { modelId, obsDim, actionDim, cmdSize, obsType, decimation, actionScale, defaultPose, obsExtra, targetHeight, imitation }
 let addrs = null; // { qposAdr, dofAdr, gyroAdr, torsoId, ballQposAdr, ballDofAdr, ctrlRange, jntRange }
 let standPose = null;
 let data = null;
+let imit = null; // { dim, frames, fps, duration, targets, rootY, baseY }
+let imitBuf = null;
+let policyDt = 0.02;
+let pointSnapshot = null; // [x, y] | null (Punkt-Modus, Snapshot je Eval)
 
 const BALL_RADIUS = 0.05;
 
@@ -48,7 +52,23 @@ async function boot(payload) {
     jointNames: payload.jointNames,
     torsoBody: payload.torsoBody,
     gyroSensor: payload.gyroSensor,
+    obsExtra: payload.obsExtra ?? 0,
+    targetHeight: payload.targetHeight ?? (payload.modelId === "microduck" ? 0.12 : 0.72),
+    imitation: payload.imitation ?? null,
   };
+  if (ctx.imitation) {
+    imit = {
+      dim: ctx.imitation.dim,
+      frames: ctx.imitation.frames,
+      fps: ctx.imitation.fps,
+      duration: ctx.imitation.duration,
+      targets: new Float32Array(ctx.imitation.targets),
+      rootY: new Float32Array(ctx.imitation.rootY),
+      baseY: ctx.imitation.baseY,
+    };
+    imitBuf = new Float32Array(imit.dim);
+  }
+  policyDt = ctx.decimation * (payload.modelId === "microduck" ? 0.005 : 0.002);
 
   const MJ_OBJ_BODY = mujoco.mjtObj.mjOBJ_BODY.value ?? 1;
   const MJ_OBJ_KEY = mujoco.mjtObj.mjOBJ_KEY.value ?? 6;
@@ -168,7 +188,30 @@ function buildObs(lastAction, cmd, obs) {
     for (let j = 0; j < ctx.actionDim; j++) obs[i++] = lastAction[j];
     for (let c = 0; c < ctx.cmdSize; c++) obs[i++] = cmd[c];
   }
+  if (ctx.obsExtra >= 2 && obs.length >= i + 2) {
+    obs[i++] = imitPhase[0];
+    obs[i++] = imitPhase[1];
+  }
   return obs;
+}
+
+// ── v2.1: Imitations-Sampling (identisch zu src/lib/md/es.ts) ──
+let imitPhase = [0, 1];
+let imitTarget = null;
+let imitRootDelta = null;
+
+function imitSampleAt(d, t, out) {
+  const tt = d.duration > 0 ? ((t % d.duration) + d.duration) % d.duration : 0;
+  const x = tt * d.fps;
+  const f0 = Math.min(d.frames - 1, Math.floor(x));
+  const f1 = Math.min(d.frames - 1, f0 + 1);
+  const u = x - f0;
+  for (let j = 0; j < d.dim; j++) {
+    const a = d.targets[f0 * d.dim + j];
+    const b = d.targets[f1 * d.dim + j];
+    out[j] = a + (b - a) * u;
+  }
+  return (d.rootY[f0] + (d.rootY[f1] - d.rootY[f0]) * u) - d.baseY;
 }
 
 function isFallen() {
@@ -197,7 +240,7 @@ function mlpForward(layout, w1, b1, w2, b2, obs, hiddenBuf, act) {
   return act;
 }
 
-function runRollout(theta, layout, reward, steps) {
+function runRollout(theta, layout, reward, steps, targetPoint) {
   resetToKeyframe();
   const o = layout.obsDim, h = layout.hidden;
   const w1 = theta.slice(0, h * o);
@@ -212,7 +255,14 @@ function runRollout(theta, layout, reward, steps) {
   const cmd = new Float32Array(ctx.cmdSize);
   const T = reward.terms;
   let sum = 0, n = 0, fell = false;
+  let tImit = 0; // Imitations-Zeit (s)
   for (let t = 0; t < steps; t++) {
+    if (imit && imitBuf) {
+      imitRootDelta = imitSampleAt(imit, tImit, imitBuf);
+      imitTarget = imitBuf;
+      const ph = (imit.duration > 0 ? (tImit % imit.duration) / imit.duration : 0) * 2 * Math.PI;
+      imitPhase = [Math.sin(ph), Math.cos(ph)];
+    }
     buildObs(lastAction, cmd, obs);
     mlpForward(layout, w1, b1, w2, b2, obs, hiddenBuf, act);
     lastAction.set(act);
@@ -280,7 +330,33 @@ function runRollout(theta, layout, reward, steps) {
       }
       if (cnt > 0) val -= T.jointLimit.weight * (pen / cnt);
     }
+    // ── v2.1: Imitation ──
+    if (T.imitate?.enabled && imitTarget) {
+      let err = 0;
+      for (let j = 0; j < addrs.qposAdr.length; j++) {
+        err += Math.abs(qpos0[addrs.qposAdr[j]] - imitTarget[j]);
+      }
+      err /= Math.max(1, addrs.qposAdr.length);
+      val += T.imitate.weight * Math.max(0, 1 - err / Math.max(0.05, T.imitate.param));
+    }
+    if (T.imitHeight?.enabled && imitRootDelta !== null) {
+      const zt = ctx.targetHeight + imitRootDelta;
+      val -= T.imitHeight.weight
+        * Math.min(1, Math.abs(data.qpos[2] - zt) / Math.max(0.05, T.imitHeight.param));
+    }
+    // ── v2.1: Punkt-Modus ──
+    if ((T.pointChase?.enabled || T.pointAvoid?.enabled) && pointSnapshot) {
+      const px = data.body(addrs.torsoId).xpos;
+      const d = Math.hypot(px[0] - pointSnapshot[0], px[1] - pointSnapshot[1]);
+      if (T.pointChase?.enabled) {
+        val += T.pointChase.weight * Math.max(0, 1 - d / Math.max(0.05, T.pointChase.param));
+      }
+      if (T.pointAvoid?.enabled) {
+        val += T.pointAvoid.weight * Math.min(1, d / Math.max(0.05, T.pointAvoid.param));
+      }
+    }
     sum += val;
+    tImit += policyDt;
     prevAct.set(act);
     if (isFallen()) {
       fell = true;
@@ -299,7 +375,8 @@ self.onmessage = async (e) => {
       post({ type: "ready", workerId: msg.workerId });
     } else if (msg.type === "eval") {
       const theta = new Float32Array(msg.theta);
-      const r = runRollout(theta, msg.layout, msg.reward, msg.rolloutSteps);
+      pointSnapshot = msg.targetPoint ? msg.targetPoint : null;
+      const r = runRollout(theta, msg.layout, msg.reward, msg.rolloutSteps, pointSnapshot);
       post({ type: "result", jobId: msg.jobId, ...r });
     }
   } catch (err) {

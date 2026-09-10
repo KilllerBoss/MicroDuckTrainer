@@ -1,8 +1,10 @@
-// ── MicroDuck Trainer v2.0 – MJCF-Aufbereitung ───────────────────────────────
+// ── MicroDuck Trainer v2.1 – MJCF-Aufbereitung ───────────────────────────────
 // Wird sowohl vom Engine-Boot (Main-Thread) als auch vom ES-Worker benutzt,
 // damit Physik-XML und VFS-Dateiliste identisch sind. Muster: reference/game.js.
 
 import type { ModelMeta, ModelId } from "./models";
+import type { WorldBuild, WorldGeom } from "./worldgen";
+import { worldGeomXmlAttr } from "./worldgen";
 
 const BALL_RADIUS = 0.05;
 const BALL_PARK = "50 0 0.05"; // geparkt = abwesend
@@ -12,9 +14,10 @@ export function buildPhysicsXml(
   modelId: ModelId,
   src: string,
   meta: ModelMeta,
+  world?: WorldBuild | null,
 ): { xml: string; meshFiles: string[] } {
-  if (modelId === "unitree_g1") return buildG1Xml(src, meta);
-  return buildDuckXml(src, meta);
+  if (modelId === "unitree_g1") return buildG1Xml(src, meta, world ?? null);
+  return buildDuckXml(src, meta, world ?? null);
 }
 
 /** Für den ES-Worker: identisches Ergebnis inkl. Metadaten-Paket. */
@@ -22,11 +25,12 @@ export function buildPhysicsXmlForWorker(
   modelId: ModelId,
   src: string,
   meta: ModelMeta,
+  world?: WorldBuild | null,
 ): {
   xml: string; meshBase: string; vfsPrefix: string; meshFiles: string[];
   modelId: ModelId; obsDim: number; actionDim: number;
 } {
-  const { xml, meshFiles } = buildPhysicsXml(modelId, src, meta);
+  const { xml, meshFiles } = buildPhysicsXml(modelId, src, meta, world ?? null);
   return {
     xml, meshFiles,
     meshBase: meta.meshBase,
@@ -37,7 +41,22 @@ export function buildPhysicsXmlForWorker(
   };
 }
 
-function buildDuckXml(src: string, meta: ModelMeta): { xml: string; meshFiles: string[] } {
+/** Hängt die Welt-Geoms an das worldbody-Element. */
+function appendWorldGeoms(doc: Document, wb: Element, geoms: WorldGeom[]): void {
+  const mk = (tag: string, attrs: Record<string, string>) => {
+    const e = doc.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+    return e;
+  };
+  for (const g of geoms) {
+    const e = mk("geom", worldGeomXmlAttr(g));
+    e.setAttribute("contype", "1");
+    e.setAttribute("conaffinity", "1");
+    wb.appendChild(e);
+  }
+}
+
+function buildDuckXml(src: string, meta: ModelMeta, world: WorldBuild | null): { xml: string; meshFiles: string[] } {
   const doc = new DOMParser().parseFromString(src, "text/xml");
   // Visual-Geoms raus → VFS braucht nur die Kollisions-Meshes (~10 Dateien)
   for (const g of [...doc.querySelectorAll('geom[class="visual"]')]) g.remove();
@@ -55,9 +74,13 @@ function buildDuckXml(src: string, meta: ModelMeta): { xml: string; meshFiles: s
     return e;
   };
   root.appendChild(el("option", { timestep: String(meta.timestep) }));
+  const holesDuck = !!world?.holes;
   doc.querySelector("worldbody")!.appendChild(
-    el("geom", { name: "floor", type: "plane", size: "0 0 0.05", pos: "0 0 0" }),
+    holesDuck
+      ? el("geom", { name: "catch_plane", type: "plane", size: "0 0 0.05", pos: "0 0 -2.5" })
+      : el("geom", { name: "floor", type: "plane", size: "0 0 0.05", pos: "0 0 0" }),
   );
+  if (world) appendWorldGeoms(doc, doc.querySelector("worldbody")!, world.geoms);
   // Arenen-Wände wie im Original (halten Ente + Ball im 3×3-m-Feld)
   const ht = 0.05 / 2, hh = 0.25 / 2;
   const off = 1.5 + ht, span = 1.5 + 0.05;
@@ -97,7 +120,7 @@ function buildDuckXml(src: string, meta: ModelMeta): { xml: string; meshFiles: s
   return { xml: new XMLSerializer().serializeToString(doc), meshFiles };
 }
 
-function buildG1Xml(src: string, meta: ModelMeta): { xml: string; meshFiles: string[] } {
+function buildG1Xml(src: string, meta: ModelMeta, world: WorldBuild | null): { xml: string; meshFiles: string[] } {
   const doc = new DOMParser().parseFromString(src, "text/xml");
   const root = doc.documentElement;
   const el = (tag: string, attrs: Record<string, string>) => {
@@ -109,8 +132,14 @@ function buildG1Xml(src: string, meta: ModelMeta): { xml: string; meshFiles: str
   if (opt) opt.setAttribute("timestep", String(meta.timestep));
   else root.appendChild(el("option", { timestep: String(meta.timestep) }));
   // Boden + große Arena (Humanoid braucht mehr Platz als die Ente)
+  const holesG1 = !!world?.holes;
   const wb = doc.querySelector("worldbody")!;
-  wb.appendChild(el("geom", { name: "floor", type: "plane", size: "0 0 0.05", pos: "0 0 0" }));
+  wb.appendChild(
+    holesG1
+      ? el("geom", { name: "catch_plane", type: "plane", size: "0 0 0.05", pos: "0 0 -2.5" })
+      : el("geom", { name: "floor", type: "plane", size: "0 0 0.05", pos: "0 0 0" }),
+  );
+  if (world) appendWorldGeoms(doc, wb, world.geoms);
   const A = 4.0, ht = 0.05 / 2, hh = 0.4 / 2;
   const off = A + ht, span = A + 0.05;
   for (const w of [

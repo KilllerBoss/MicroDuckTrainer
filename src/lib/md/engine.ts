@@ -4,6 +4,7 @@
 
 import type { ModelMeta, ModelId } from "./models";
 import { getModel } from "./models";
+import type { WorldBuild } from "./worldgen";
 
 // Minimale strukturelle Typen für die Emscripten-Bindings (@mujoco/mujoco).
 type MujocoModule = any;
@@ -58,6 +59,10 @@ async function fillVfs(mujoco: MujocoModule, meshBase: string, vfsPrefix: string
   return vfs;
 }
 
+function meta_obsDim(meta: ModelMeta | null): number {
+  return meta ? meta.obsDim : 61;
+}
+
 // ── Engine ───────────────────────────────────────────────────────────────────
 
 export class Engine {
@@ -74,17 +79,31 @@ export class Engine {
   standPose: Float32Array = new Float32Array(0); // Gelenk-Sollwerte des Keyframes
   loadedId: ModelId | null = null;
 
-  /** Kompiliert das Modell eines Roboters; alte Instanz wird freigegeben. */
-  async load(modelId: ModelId): Promise<void> {
+  // ── v2.1: Welt, Punkt-Ziel, Imitation ──
+  private worldKey: string | null = null;
+  /** Joystick-Punkt (Welt-X/Y) für Reward pointChase/pointAvoid. */
+  targetPoint: [number, number] | null = null;
+  /** Gelenk-Ziele der Animation (Imitation); null = aus. */
+  imitTarget: Float32Array | null = null;
+  /** Wurzel-Höhen-Delta der Animation (m); null = aus. */
+  imitRootDelta: number | null = null;
+  /** Aktuelle Phase [sin, cos] der Animation (0..1 → 2π). */
+  imitPhase: [number, number] | null = null;
+
+  /** Kompiliert das Modell eines Roboters; alte Instanz wird freigegeben.
+   *  world: Random-Welt (Geoms werden ins MJCF injiziert) – Änderung erzwingt Rebuild. */
+  async load(modelId: ModelId, world?: WorldBuild | null): Promise<void> {
     const meta = getModel(modelId);
-    if (this.loadedId === modelId && this.model) {
+    const wk = world ? `${world.holes ? "h" : "f"}:${world.geoms.length}` : null;
+    if (this.loadedId === modelId && this.model && wk === this.worldKey) {
       this.resetToKeyframe();
       return;
     }
     const mujoco = await loadMujocoRuntime();
     this.mujoco = mujoco;
     const src = await (await fetch(meta.mjcf)).text();
-    const built = buildPhysicsXml(modelId, src, meta);
+    const built = buildPhysicsXml(modelId, src, meta, world ?? null);
+    this.worldKey = wk;
 
     this.dispose();
     this.vfs = await fillVfs(mujoco, meta.meshBase, meta.vfsPrefix, built.meshFiles);
@@ -171,6 +190,7 @@ export class Engine {
     }
     this.lastAction.fill(0);
     this.cmd.fill(0);
+    this.imitPhase = null;
     // Positionaktuatoren (G1, kp=500): sonst zieht ctrl=0 die Gelenke nach 0!
     this.applyCtrlFromPose(this.standPose);
   }
@@ -270,7 +290,28 @@ export class Engine {
       for (let j = 0; j < meta.actionDim; j++) obs[i++] = this.lastAction[j];
       for (let c = 0; c < meta.cmdSize; c++) obs[i++] = this.cmd[c];
     }
+    if (this.imitPhase && obs.length >= i + 2) {
+      obs[i++] = this.imitPhase[0];
+      obs[i++] = this.imitPhase[1];
+    }
     return obs;
+  }
+
+  /** Obs-Buffer vergrößern (Imitations-Phase +2) oder zurücksetzen. */
+  setImitObs(on: boolean): void {
+    const need = meta_obsDim(this.meta) + (on ? 2 : 0);
+    if (this.obs.length !== need) this.obs = new Float32Array(need);
+    if (!on) this.imitPhase = null;
+  }
+
+  /** Sicht auf die Obs: ohne Phase (ONNX braucht exakte Dimension) oder mit. */
+  obsFor(extra: boolean): Float32Array {
+    const base = meta_obsDim(this.meta);
+    if (!extra) {
+      const v = this.obs.subarray(0, base);
+      return v.length === base ? v : this.obs.subarray(0, base);
+    }
+    return this.obs;
   }
 
   // ── Zustands-Helfer ────────────────────────────────────────────────────────

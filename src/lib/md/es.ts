@@ -9,6 +9,33 @@ import { getModel } from "./models";
 import { Engine } from "./engine";
 import { MlpPolicy, type MlpLayout } from "./policy";
 import type { RewardConfig } from "./rewards";
+import type { WorldBuild } from "./worldgen";
+
+/** Imitations-Daten für Rollouts (Main-Thread + Worker, identisch). */
+export interface ImitEvalData {
+  dim: number;
+  frames: number;
+  fps: number;
+  duration: number;
+  targets: Float32Array; // frames × dim
+  rootY: Float32Array; // frames (GLB y-up)
+  baseY: number;
+}
+
+/** Zielpose + Wurzel-Delta zum Zeitpunkt t (loop). Schreibt in out. */
+export function imitSampleAt(d: ImitEvalData, t: number, out: Float32Array): number {
+  const tt = d.duration > 0 ? ((t % d.duration) + d.duration) % d.duration : 0;
+  const x = tt * d.fps;
+  const f0 = Math.min(d.frames - 1, Math.floor(x));
+  const f1 = Math.min(d.frames - 1, f0 + 1);
+  const u = x - f0;
+  for (let j = 0; j < d.dim; j++) {
+    const a = d.targets[f0 * d.dim + j];
+    const b = d.targets[f1 * d.dim + j];
+    out[j] = a + (b - a) * u;
+  }
+  return (d.rootY[f0] + (d.rootY[f1] - d.rootY[f0]) * u) - d.baseY;
+}
 
 export type TurboLevel = 1 | 4 | 16 | 32 | 64;
 
@@ -48,6 +75,7 @@ interface RolloutCtx {
   mlp: MlpPolicy;
   steps: number;
   n: number;
+  t: number; // Imitations-Zeit (s)
   sum: number;
   fell: boolean;
   done: boolean;
@@ -60,6 +88,7 @@ function resetCtx(engine: Engine, ctx: RolloutCtx) {
   engine.resetToKeyframe();
   engine.cmd.fill(0);
   ctx.n = 0;
+  ctx.t = 0;
   ctx.sum = 0;
   ctx.fell = false;
   ctx.done = false;
@@ -132,17 +161,55 @@ export function stepRewardValue(
     }
     if (cnt > 0) val -= T.jointLimit.weight * (pen / cnt);
   }
+  // ── v2.1: Imitation ──
+  if (T.imitate?.enabled && engine.imitTarget) {
+    const angles = engine.jointAngles();
+    const tgt = engine.imitTarget;
+    let err = 0;
+    for (let j = 0; j < angles.length; j++) err += Math.abs(angles[j] - tgt[j]);
+    err /= Math.max(1, angles.length);
+    val += T.imitate.weight * Math.max(0, 1 - err / Math.max(0.05, T.imitate.param));
+  }
+  if (T.imitHeight?.enabled && engine.imitRootDelta !== null) {
+    const zt = engine.meta.targetHeight + engine.imitRootDelta;
+    val -= T.imitHeight.weight
+      * Math.min(1, Math.abs(engine.height() - zt) / Math.max(0.05, T.imitHeight.param));
+  }
+  // ── v2.1: Punkt-Modus ──
+  if ((T.pointChase?.enabled || T.pointAvoid?.enabled) && engine.targetPoint) {
+    const [tx, ty] = engine.targetPoint;
+    const p = engine.torsoPos();
+    const d = Math.hypot(p[0] - tx, p[1] - ty);
+    if (T.pointChase?.enabled) {
+      val += T.pointChase.weight * Math.max(0, 1 - d / Math.max(0.05, T.pointChase.param));
+    }
+    if (T.pointAvoid?.enabled) {
+      val += T.pointAvoid.weight * Math.min(1, d / Math.max(0.05, T.pointAvoid.param));
+    }
+  }
   return val;
 }
 
 /** Genau EINEN Policy-Step des Rollouts (Rundeneinteilung für Interleaving). */
-function ctxStep(engine: Engine, ctx: RolloutCtx, cfg: RewardConfig): void {
+function ctxStep(
+  engine: Engine, ctx: RolloutCtx, cfg: RewardConfig,
+  imit: ImitEvalData | null, imitBuf: Float32Array | null, policyDt: number,
+): void {
+  const T = cfg.terms;
   engine.setData(ctx.data);
-  const obs = engine.buildObs();
+  if (imit && imitBuf) {
+    const delta = imitSampleAt(imit, ctx.t, imitBuf);
+    engine.imitTarget = imitBuf;
+    engine.imitRootDelta = delta;
+    const ph = (imit.duration > 0 ? (ctx.t % imit.duration) / imit.duration : 0) * 2 * Math.PI;
+    engine.imitPhase = [Math.sin(ph), Math.cos(ph)];
+  }
+  const obs = engine.obsFor(!!imit);
   ctx.mlp.forward(obs, ctx.act);
   engine.lastAction.set(ctx.act);
   engine.stepWithAction(ctx.act);
   ctx.n++;
+  ctx.t += policyDt;
 
   ctx.sum += stepRewardValue(engine, cfg, ctx.act, ctx.prevAct);
   ctx.prevAct.set(ctx.act);
@@ -187,6 +254,12 @@ export class EsTrainer {
   sinceImprovement = 0;
   evaluator: "worker" | "main" = "main";
   workersReady = 0;
+  // v2.1: Welt + Imitation für Rollouts
+  obsExtra = 0;
+  world: WorldBuild | null = null;
+  imit: ImitEvalData | null = null;
+  imitSig = "";
+  obsExtraActive = false; // Phase aktuell in der Obs?
 
   private workers: Worker[] = [];
   private pending = new Map<number, (r: { fitness: number; fell: boolean; steps: number }) => void>();
@@ -195,19 +268,32 @@ export class EsTrainer {
   private stepsCounter = 0;
   // MjData-Pool: Rollout-Instanzen werden wiederverwendet (kein Leak je Generation)
   private dataPool: any[] = [];
+  private imitBuf: Float32Array | null = null;
+  private policyDt = 0.02;
 
-  constructor(modelId: ModelId, theta: Float32Array, layout: MlpLayout, reward: RewardConfig) {
+  constructor(
+    modelId: ModelId, theta: Float32Array, layout: MlpLayout, reward: RewardConfig,
+    opts?: { obsExtra?: number; world?: WorldBuild | null; imit?: ImitEvalData | null; imitSig?: string },
+  ) {
     this.modelId = modelId;
     this.meta = getModel(modelId);
     this.theta = theta.slice();
     this.layout = layout;
     this.reward = reward;
     this.bestTheta = theta.slice();
+    this.obsExtra = opts?.obsExtra ?? 0;
+    this.world = opts?.world ?? null;
+    this.imit = opts?.imit ?? null;
+    this.imitSig = opts?.imitSig ?? "";
     this.engine = new Engine();
   }
 
   async init(): Promise<void> {
-    await this.engine.load(this.modelId);
+    this.policyDt = this.meta.timestep * this.meta.decimation;
+    await this.engine.load(this.modelId, this.world ?? undefined);
+    this.imitBuf = this.imit ? new Float32Array(this.imit.dim) : null;
+    this.engine.setImitObs(this.obsExtra > 0);
+    this.obsExtraActive = this.obsExtra > 0;
   }
 
   /** Versucht, Eval-Worker zu starten (Module-Worker mit import('/wasm/mujoco.js')). */
@@ -233,7 +319,7 @@ export class EsTrainer {
   private async buildWorkerPayload(): Promise<WorkerInitPayload> {
     const src = await (await fetch(this.meta.mjcf)).text();
     const { buildPhysicsXmlForWorker } = await import("./xml");
-    const base = buildPhysicsXmlForWorker(this.modelId, src, this.meta);
+    const base = buildPhysicsXmlForWorker(this.modelId, src, this.meta, this.world ?? null);
     return {
       ...base,
       cmdSize: this.meta.cmdSize,
@@ -245,6 +331,15 @@ export class EsTrainer {
       torsoBody: this.meta.torsoBody,
       gyroSensor: this.meta.gyroSensor,
       keyframe: this.meta.keyframe,
+      obsExtra: this.obsExtra,
+      targetHeight: this.meta.targetHeight,
+      imitation: this.imit
+        ? {
+            dim: this.imit.dim, frames: this.imit.frames, fps: this.imit.fps,
+            duration: this.imit.duration, targets: this.imit.targets.buffer,
+            rootY: this.imit.rootY.buffer, baseY: this.imit.baseY,
+          }
+        : null,
     };
   }
 
@@ -298,10 +393,17 @@ export class EsTrainer {
         type: "eval", jobId,
         theta: copy.buffer, layout: this.layout, reward: this.reward,
         rolloutSteps: this.rolloutSteps,
+        targetPoint: this.pointSnapshot ? [...this.pointSnapshot] : null,
       },
       [copy.buffer],
     );
     return p;
+  }
+
+  /** Aktueller Punkt-Snapshot für Worker-Rewards (Punkt-Modus). */
+  pointSnapshot: [number, number] | null = null;
+  setTargetPoint(p: [number, number] | null): void {
+    this.pointSnapshot = p;
   }
 
   /** Evaluierung der Population: Worker-Pool oder Main-Thread-Interleaving. */
@@ -326,7 +428,7 @@ export class EsTrainer {
             data: this.dataPool.pop() ?? this.engine.newData(),
             mlp: new MlpPolicy(this.layout, m),
             steps: this.rolloutSteps,
-            n: 0, sum: 0, fell: false, done: false,
+            n: 0, t: 0, sum: 0, fell: false, done: false,
             prevAct: new Float32Array(this.layout.actionDim),
             act: new Float32Array(this.layout.actionDim),
           };
@@ -335,7 +437,9 @@ export class EsTrainer {
         });
         while (ctxs.some((c) => !c.done)) {
           for (const ctx of ctxs) {
-            if (!ctx.done) ctxStep(this.engine, ctx, this.reward);
+            if (!ctx.done) {
+              ctxStep(this.engine, ctx, this.reward, this.imit, this.imitBuf, this.policyDt);
+            }
           }
           await new Promise<void>((r) => setTimeout(r, 0)); // UI-Yield
         }
@@ -383,14 +487,19 @@ export class EsTrainer {
       shaped[memberIdx] = rank / (n - 1) - 0.5;
     });
 
-    // Gradienten-Update: theta += lr/(n*sigma) * Σ shaped_i * eps_i
+    // Gradienten-Update (antithetisch): theta += lr/sigma * Σ_i (s⁺_i − s⁻_i) · eps_i
+    // members[2i] = theta+eps_i, members[2i+1] = theta−eps_i → epsilons hat
+    // nur `pairs` Einträge (v2.0-Bug: Loop lief über n=pop → undefined-Crash).
     const grad = new Float32Array(this.theta.length);
-    for (let i = 0; i < n; i++) {
+    for (let i = 0; i < pairs; i++) {
       const eps = epsilons[i];
-      const s = shaped[i];
+      const sPlus = shaped[2 * i] ?? 0;
+      const sMinus = shaped[2 * i + 1] ?? 0;
+      const s = sPlus - sMinus;
+      if (s === 0) continue;
       for (let j = 0; j < grad.length; j++) grad[j] += s * eps[j];
     }
-    const norm = (this.lr * n) / (n * this.sigma);
+    const norm = this.lr / this.sigma;
     for (let j = 0; j < this.theta.length; j++) {
       this.theta[j] += grad[j] * norm;
     }
@@ -450,6 +559,13 @@ export interface WorkerInitPayload {
   cmdSize: number; obsType: string; decimation: number; actionScale: number;
   defaultPose: number[]; jointNames: string[];
   torsoBody: string; gyroSensor: string | null; keyframe: string;
+  // v2.1
+  obsExtra: number;
+  targetHeight: number;
+  imitation: {
+    dim: number; frames: number; fps: number; duration: number;
+    targets: ArrayBufferLike; rootY: ArrayBufferLike; baseY: number;
+  } | null;
 }
 
 interface WorkerResultMsg {

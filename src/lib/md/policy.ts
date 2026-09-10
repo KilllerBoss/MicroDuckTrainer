@@ -242,20 +242,25 @@ export async function extractMlpFromOnnx(
 
 /**
  * Warm-Start: versucht, die Standard-Policy als MLP zu laden; sonst Zufall.
+ * extra: zusätzliche Obs-Dimensionen (v2.1: +2 für Imitations-Phase → kein
+ * ONNX-Warmstart möglich, da die ONNX-Inputform exakt passen muss).
  */
-export async function warmStartMlp(meta: ModelMeta): Promise<{
+export async function warmStartMlp(meta: ModelMeta, extra = 0): Promise<{
   theta: Float32Array;
   layout: MlpLayout;
   warm: boolean;
 }> {
-  const policy = meta.policies.find((p) => p.id === meta.defaultOnnx) ?? meta.policies[0];
+  const o = meta.obsDim + extra;
+  const policy = extra === 0
+    ? meta.policies.find((p) => p.id === meta.defaultOnnx) ?? meta.policies[0]
+    : undefined;
   if (policy) {
     const r = await extractMlpFromOnnx(policy.url, meta.obsDim, meta.actionDim);
     if (r) return { ...r, warm: true };
   }
   return {
-    theta: MlpPolicy.randomTheta(meta.obsDim, 32, meta.actionDim),
-    layout: { obsDim: meta.obsDim, hidden: 32, actionDim: meta.actionDim },
+    theta: MlpPolicy.randomTheta(o, 32, meta.actionDim),
+    layout: { obsDim: o, hidden: 32, actionDim: meta.actionDim },
     warm: false,
   };
 }

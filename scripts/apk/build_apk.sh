@@ -1,8 +1,9 @@
 #!/bin/bash
-# MicroDuck Trainer v2.0 – APK-Build ohne Android Studio
+# MicroDuck Trainer v2.1 – APK-Build ohne Android Studio
 # Schritte: Icons → javac → D8 → aapt2 link (+90MB Assets) → DEX einfügen → zipalign → signieren
 set -e
 cd /home/z/my-project
+ROOT=$PWD
 export JAVA_HOME=${JAVA_HOME:-$PWD/scripts/android-sdk/jdk-21.0.12.1+1}
 BT=$PWD/scripts/android-sdk/bt
 PLATFORM=$PWD/scripts/android-sdk/plat/android.jar
@@ -10,9 +11,9 @@ R8=$PWD/scripts/android-sdk/r8.jar
 APK=scripts/apk
 OUT=$PWD/out
 BUILD=$PWD/scripts/apk/build-v2
-VERSION_CODE=2
-VERSION_NAME=2.0
-FINAL=download/MicroDuckTrainer-v2.0.apk
+VERSION_CODE=3
+VERSION_NAME=2.1
+FINAL=download/MicroDuckTrainer-v2.1.apk
 
 rm -rf "$BUILD"
 mkdir -p "$BUILD/classes" "$BUILD/dexout" download
@@ -64,14 +65,17 @@ LD_LIBRARY_PATH="$BT" "$BT/zipalign" -f 4 app-with-dex.apk app-aligned.apk
 echo "aligned"
 
 echo "== [7/7] Signieren (v1+v2) =="
-if [ ! -f microduck-trainer.keystore ]; then
+# Keystorepersistent: liegt in download/ (gleiche Signatur wie v2.0 → Update ohne Deinstallation)
+KS_SRC=$ROOT/download/microduck-trainer.keystore
+if [ ! -f "$KS_SRC" ]; then
   "$JAVA_HOME/bin/keytool" -genkeypair -v \
-    -keystore microduck-trainer.keystore -alias microduck \
+    -keystore "$KS_SRC" -alias microduck \
     -keyalg RSA -keysize 2048 -validity 10950 \
     -storepass microduck2026 -keypass microduck2026 \
     -dname "CN=MicroDuck Trainer, O=MicroDuck, C=DE" >/dev/null 2>&1
-  echo "Keystore neu erstellt (NEUE Signatur – v1.0 muss deinstalliert werden)"
+  echo "Keystore NEU erstellt (andere Signatur!)"
 fi
+cp "$KS_SRC" microduck-trainer.keystore
 "$BT/apksigner" sign \
   --ks microduck-trainer.keystore \
   --ks-pass pass:microduck2026 --key-pass pass:microduck2026 \

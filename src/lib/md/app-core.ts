@@ -10,10 +10,18 @@ import {
 } from "./rig";
 import { OnnxPolicy, MlpPolicy, warmStartMlp, type MlpLayout } from "./policy";
 import { getModel, type ModelId } from "./models";
-import { EsTrainer, stepRewardValue, type EsStats, type TurboLevel } from "./es";
+import { EsTrainer, stepRewardValue, type EsStats, type TurboLevel, type ImitEvalData } from "./es";
 import type { MappingEntry, SourceId } from "./mapping";
 import { poseById, loadMapping, saveMapping } from "./mapping";
 import { loadRewardConfig, saveRewardConfig, type RewardConfig } from "./rewards";
+import {
+  defaultWorldConfig, generateWorld, arenaHalf, randomSeed,
+  buildWorldMeshes, type WorldConfig, type WorldBuild,
+} from "./worldgen";
+import {
+  buildImitClip, targetAt, rootDeltaAt, saveImitPrefs,
+  type ImitClip,
+} from "./imitation";
 
 
 export type Mode = "manuell" | "training" | "test";
@@ -41,6 +49,13 @@ export interface Telemetry {
   es: EsStats | null;
   mappings: MappingEntry[];
   reward: RewardConfig;
+  // ── v2.1 ──
+  world: WorldConfig;
+  pointMode: boolean;
+  point: [number, number];
+  imitation: {
+    name: string; duration: number; playing: boolean; time: number; mapped: number; manual: boolean;
+  } | null;
 }
 
 // Enten-Tempos wie reference/constants.js
@@ -74,6 +89,18 @@ export class TrainerCore {
   private joy = { x: 0, y: 0 };
   private pendingPolicyId: string | null = null;
   private pendingPoseId: string | null = null;
+
+  // ── v2.1: Welt, Punkt-Modus, Imitation ──
+  private worldCfg: WorldConfig = defaultWorldConfig();
+  private worldBuild: WorldBuild | null = null;
+  private pointMode = false;
+  private point: [number, number] = [0.8, 0];
+  private imitClip: ImitClip | null = null;
+  private imitPlaying = false;
+  private imitManual = false;
+  private imitTime = 0;
+  private imitTargetBuf: Float32Array | null = null;
+  private esObsExtra = 0; // Obs-Extra der aktuellen esView
 
   // Posen-Blending
   private g1Base: Float32Array | null = null;
@@ -114,6 +141,7 @@ export class TrainerCore {
       await this.loadModel("microduck");
       this.booted = true;
       this.running = true;
+      if (typeof window !== "undefined") (window as any).__mdt = this; // QA-Hook
       this.lastFrameT = performance.now();
       void this.controlLoop();
       requestAnimationFrame(this.renderLoop);
@@ -144,7 +172,14 @@ export class TrainerCore {
       const needRig = this.modelId !== id ||
         !(this.world && (id === "microduck" ? this.world.duckRig : this.world.g1Rig));
 
-      const tasks: Promise<any>[] = [this.engine.load(id)];
+      // Welt-Konfiguration (global persistiert) auf dieses Modell anwenden
+      this.worldCfg = loadWorldPrefs();
+      this.worldBuild = this.worldCfg.enabled ? generateWorld(this.worldCfg, id) : null;
+      this.applyWorldVisuals();
+      this.pointMode = loadPointPrefs(id);
+      this.point = [0.8, 0];
+
+      const tasks: Promise<any>[] = [this.engine.load(id, this.worldBuild)];
       if (needRig && this.world) tasks.push(mountRig(this.world, id));
       if (id === "microduck") tasks.push(this.getOnnxSession(meta.defaultOnnx).catch(() => null));
       await Promise.all(tasks);
@@ -153,6 +188,9 @@ export class TrainerCore {
       this.selectedOnnx = meta.defaultOnnx;
       this.source = "onnx";
       this.g1Base = new Float32Array(this.engine.standPose);
+      this.esObsExtra = 0;
+      this.engine.setImitObs(false);
+      this.engine.targetPoint = this.pointMode ? [...this.point] as [number, number] : null;
       this.prevAct = new Float32Array(meta.actionDim);
       this.actBuf = new Float32Array(meta.actionDim);
       // Mappings + Bewertung pro Modell laden (Persistenz)
@@ -180,6 +218,7 @@ export class TrainerCore {
     this.fallDebounce = 0;
     this.joy.x = 0;
     this.joy.y = 0;
+    this.imitTime = 0;
   }
 
   // ── Setter (von der UI) ─────────────────────────────────────────────────────
@@ -236,6 +275,151 @@ export class TrainerCore {
     this.emit();
   }
 
+  // ── v2.1: Welt ─────────────────────────────────────────────────────────────
+
+  async setWorld(cfg: WorldConfig): Promise<void> {
+    if (this.loading) return;
+    this.loading = true;
+    this.loadingText = "Baue Welt…";
+    this.emit();
+    try {
+      this.stopTraining();
+      this.trainer?.dispose();
+      this.trainer = null;
+      this.esView = null;
+      this.esObsExtra = 0;
+      this.worldCfg = { ...cfg, features: { ...cfg.features } };
+      saveWorldPrefs(this.worldCfg);
+      this.worldBuild = this.worldCfg.enabled
+        ? generateWorld(this.worldCfg, this.modelId ?? "microduck")
+        : null;
+      this.applyWorldVisuals();
+      await this.engine.load(this.modelId ?? "microduck", this.worldBuild);
+      this.engine.targetPoint = this.pointMode ? ([...this.point] as [number, number]) : null;
+      this.error = null;
+    } catch (err: any) {
+      this.error = err?.message || String(err);
+      console.error("[core] Welt-Build fehlgeschlagen:", err);
+    } finally {
+      this.loading = false;
+      this.emit();
+    }
+  }
+
+  rerollWorld(): void {
+    void this.setWorld({ ...this.worldCfg, seed: randomSeed() });
+  }
+
+  get worldConfig(): WorldConfig {
+    return this.worldCfg;
+  }
+
+  private applyWorldVisuals(): void {
+    if (!this.world) return;
+    this.world.setWorldProps(this.worldBuild ? buildWorldMeshes(this.worldBuild) : null);
+  }
+
+  // ── v2.1: Punkt-Modus ──────────────────────────────────────────────────────
+
+  setPointMode(on: boolean): void {
+    this.pointMode = on;
+    if (this.modelId) savePointPrefs(this.modelId, on);
+    this.engine.targetPoint = on ? ([...this.point] as [number, number]) : null;
+    this.trainer?.setTargetPoint(on ? ([...this.point] as [number, number]) : null);
+    this.emit();
+  }
+
+  get isPointMode(): boolean {
+    return this.pointMode;
+  }
+
+  // ── v2.1: Imitation ────────────────────────────────────────────────────────
+
+  /** GLB-Clip bauen und aktivieren; Reward-Terme automatisch scharf schalten. */
+  async activateAnimation(
+    buffer: ArrayBuffer, clipIndex: number, mirror: boolean, modelId: ModelId,
+  ): Promise<{ ok: boolean; message: string }> {
+    try {
+      if (this.trainingActive) this.stopTraining();
+      this.trainer?.dispose();
+      this.trainer = null;
+      this.esView = null;
+      this.esObsExtra = 0;
+      const meta = getModel(modelId);
+      const clip = await buildImitClip(buffer, clipIndex, meta, mirror);
+      if (clip.mapped === 0) {
+        return { ok: false, message: "Keine Gelenke gemappt – Skeleton-Namen nicht erkannt." };
+      }
+      this.imitClip = clip;
+      this.imitPlaying = true;
+      this.imitTime = 0;
+      this.imitTargetBuf = new Float32Array(clip.dim);
+      this.engine.imitTarget = this.imitTargetBuf;
+      this.engine.imitRootDelta = null;
+      this.engine.setImitObs(true);
+      saveImitPrefs(modelId, clip.name, mirror);
+      // Terme automatisch aktivieren, falls beide aus
+      if (this.rewardCfg) {
+        const im = this.rewardCfg.terms.imitate;
+        const ih = this.rewardCfg.terms.imitHeight;
+        let changed = false;
+        if (im && !im.enabled) { im.enabled = true; im.weight = Math.max(1.5, Math.abs(im.weight)); changed = true; }
+        if (ih && !ih.enabled) { ih.enabled = true; ih.weight = Math.max(1.0, Math.abs(ih.weight)); changed = true; }
+        if (changed && this.modelId) saveRewardConfig(this.modelId, this.rewardCfg);
+      }
+      this.emit();
+      return {
+        ok: true,
+        message: `${clip.mapped} Gelenke gemappt · ${clip.duration.toFixed(1)} s · ${clip.name}`,
+      };
+    } catch (err: any) {
+      console.error("[core] Animations-Load fehlgeschlagen:", err);
+      return { ok: false, message: err?.message || String(err) };
+    }
+  }
+
+  clearAnimation(): void {
+    this.imitClip = null;
+    this.imitPlaying = false;
+    this.imitManual = false;
+    this.imitTargetBuf = null;
+    this.engine.imitTarget = null;
+    this.engine.imitRootDelta = null;
+    this.engine.imitPhase = null;
+    this.engine.setImitObs(false);
+    this.emit();
+  }
+
+  setImitPlaying(on: boolean): void {
+    if (!this.imitClip) return;
+    this.imitPlaying = on;
+    if (!on) {
+      this.engine.imitTarget = null;
+      this.engine.imitRootDelta = null;
+      this.engine.imitPhase = null;
+    } else {
+      this.engine.imitTarget = this.imitTargetBuf;
+    }
+    this.emit();
+  }
+
+  get imitState(): ImitClip | null {
+    return this.imitClip;
+  }
+
+  get isImitPlaying(): boolean {
+    return this.imitPlaying;
+  }
+
+  get isImitManual(): boolean {
+    return this.imitManual;
+  }
+
+  setImitManual(on: boolean): void {
+    this.imitManual = on;
+    this.emit();
+  }
+
   pressButton(source: SourceId) {
     const m = this.mappings.find((e) => e.source === source);
     if (!m) return;
@@ -274,12 +458,40 @@ export class TrainerCore {
   async startTraining(): Promise<void> {
     if (this.trainingActive || !this.modelId) return;
     try {
+      const imitActive = !!(this.imitClip && this.imitPlaying);
+      const obsExtra = imitActive ? 2 : 0;
+      const imitData: ImitEvalData | null = imitActive && this.imitClip
+        ? {
+            dim: this.imitClip.dim, frames: this.imitClip.frames, fps: this.imitClip.fps,
+            duration: this.imitClip.duration, targets: this.imitClip.targets,
+            rootY: this.imitClip.rootY, baseY: this.imitClip.baseY,
+          }
+        : null;
+      const imitSig = this.imitClip
+        ? `${this.imitClip.name}|${this.imitClip.frames}|${this.imitClip.mapped}`
+        : "";
+      // Trainer wegwerfen, wenn Welt/Imitation/Obs-Layout sich geändert haben
+      if (this.trainer) {
+        const stale =
+          this.trainer.obsExtra !== obsExtra ||
+          this.trainer.world !== this.worldBuild ||
+          this.trainer.imitSig !== imitSig;
+        if (stale) {
+          this.trainer.dispose();
+          this.trainer = null;
+          this.esView = null;
+          this.esObsExtra = 0;
+        }
+      }
       if (!this.trainer) {
-        const warm = await warmStartMlp(getModel(this.modelId));
-        this.trainer = new EsTrainer(this.modelId, warm.theta, warm.layout, this.rewardCfg!);
+        const warm = await warmStartMlp(getModel(this.modelId), obsExtra);
+        this.trainer = new EsTrainer(this.modelId, warm.theta, warm.layout, this.rewardCfg!, {
+          obsExtra, world: this.worldBuild, imit: imitData, imitSig,
+        });
         await this.trainer.init();
       }
       this.trainer.setReward(this.rewardCfg!);
+      this.trainer.setTargetPoint(this.pointMode ? ([...this.point] as [number, number]) : null);
       this.trainingActive = true;
       this.emit();
       await this.trainer.tryStartWorkers();
@@ -318,6 +530,7 @@ export class TrainerCore {
     }
     try {
       this.esView = new MlpPolicy(this.trainer.layout, this.trainer.bestTheta);
+      this.esObsExtra = this.trainer.layout.obsDim - this.trainer.meta.obsDim;
     } catch {
       this.esView = null;
     }
@@ -424,6 +637,33 @@ export class TrainerCore {
     const engine = this.engine;
     if (!engine.data || !engine.meta || !this.modelId) return;
 
+    // ── v2.1: Punkt-Modus – Joystick bewegt den 3D-Punkt ──
+    const dtStep = this.stepMs() / 1000;
+    if (this.pointMode) {
+      const sp = 1.4 * dtStep;
+      const lim = arenaHalf(this.modelId) - 0.15;
+      this.point[0] = Math.min(lim, Math.max(-lim, this.point[0] + this.joy.x * sp));
+      this.point[1] = Math.min(lim, Math.max(-lim, this.point[1] + this.joy.y * sp));
+      engine.targetPoint = [this.point[0], this.point[1]];
+      this.trainer?.setTargetPoint([this.point[0], this.point[1]]);
+      this.world?.setTargetPoint(this.point[0], this.point[1], true);
+    } else if (engine.targetPoint) {
+      engine.targetPoint = null;
+      this.world?.setTargetPoint(0, 0, false);
+    }
+
+    // ── v2.1: Imitation – Zielpose je Policy-Step ──
+    if (this.imitClip && this.imitPlaying && this.imitTargetBuf) {
+      this.imitTime += dtStep;
+      targetAt(this.imitClip, this.imitTime, this.imitTargetBuf);
+      engine.imitTarget = this.imitTargetBuf;
+      engine.imitRootDelta = rootDeltaAt(this.imitClip, this.imitTime);
+      const ph = this.imitClip.duration > 0
+        ? ((this.imitTime % this.imitClip.duration) / this.imitClip.duration) * 2 * Math.PI
+        : 0;
+      engine.imitPhase = [Math.sin(ph), Math.cos(ph)];
+    }
+
     if (this.recovering) {
       this.stepRecovery();
     } else if (this.modelId === "microduck") {
@@ -451,20 +691,41 @@ export class TrainerCore {
     const engine = this.engine;
     const meta = engine.meta;
 
-    // Command-Slots (Manuell/Training: Joystick; Test: Null-Kommando)
-    let vx = 0, vy = 0, wz = 0;
-    if (this.mode !== "test") {
-      for (const m of this.mappings) {
-        if (m.targetType !== "cmd") continue;
-        const v = (m.source === "joyX" ? this.joy.x : this.joy.y) * m.gain;
-        if (m.target === "cmd_x") vx += v;
-        else if (m.target === "cmd_y") vy += v;
-        else if (m.target === "cmd_yaw") wz -= v; // Stick rechts = Rechtsdrehung
+    // Command-Slots: Punkt-Modus → Richtung zum Punkt; sonst Mappings/Test
+    if (this.pointMode && engine.targetPoint) {
+      const [tx, ty] = engine.targetPoint;
+      const p = engine.torsoPos();
+      const dx = tx - p[0], dy = ty - p[1];
+      const dist = Math.hypot(dx, dy);
+      const yaw = engine.yaw();
+      const fwd = Math.cos(yaw) * dx + Math.sin(yaw) * dy;
+      const lat = -Math.sin(yaw) * dx + Math.cos(yaw) * dy;
+      const desired = Math.atan2(dy, dx);
+      let yerr = desired - yaw;
+      while (yerr > Math.PI) yerr -= 2 * Math.PI;
+      while (yerr < -Math.PI) yerr += 2 * Math.PI;
+      if (dist > 0.12) {
+        engine.cmd[0] = clamp(VEL_FWD * 0.9 * Math.max(0, Math.cos(yerr)), VEL_BACK, VEL_FWD);
+        engine.cmd[1] = clamp(lat * 1.2, -VEL_LAT, VEL_LAT);
+        engine.cmd[2] = clamp(1.4 * yerr, -VEL_ANG, VEL_ANG);
+      } else {
+        engine.cmd[0] = 0; engine.cmd[1] = 0; engine.cmd[2] = 0;
       }
+    } else {
+      let vx = 0, vy = 0, wz = 0;
+      if (this.mode !== "test") {
+        for (const m of this.mappings) {
+          if (m.targetType !== "cmd") continue;
+          const v = (m.source === "joyX" ? this.joy.x : this.joy.y) * m.gain;
+          if (m.target === "cmd_x") vx += v;
+          else if (m.target === "cmd_y") vy += v;
+          else if (m.target === "cmd_yaw") wz -= v; // Stick rechts = Rechtsdrehung
+        }
+      }
+      engine.cmd[0] = clamp(vx, VEL_BACK, VEL_FWD);
+      engine.cmd[1] = clamp(vy, -VEL_LAT, VEL_LAT);
+      engine.cmd[2] = clamp(wz, -VEL_ANG, VEL_ANG);
     }
-    engine.cmd[0] = clamp(vx, VEL_BACK, VEL_FWD);
-    engine.cmd[1] = clamp(vy, -VEL_LAT, VEL_LAT);
-    engine.cmd[2] = clamp(wz, -VEL_ANG, VEL_ANG);
 
     // Button-Trigger (Edge)
     if (this.pendingPolicyId) {
@@ -475,6 +736,13 @@ export class TrainerCore {
       const pose = poseById("microduck", this.pendingPoseId);
       this.pendingPoseId = null;
       if (pose) this.startDuckPose(pose.targets);
+    }
+
+    // v2.1: Imitation manuell anwenden (Zielpose direkt als ctrl)
+    if (this.mode === "manuell" && this.imitManual && this.imitClip && this.imitPlaying && this.imitTargetBuf) {
+      engine.applyCtrlFromPose(this.imitTargetBuf);
+      engine.stepPhysics();
+      return;
     }
 
     // Pose-Hold (kurze Overlay-Phase, dann zurück zur Policy)
@@ -508,7 +776,10 @@ export class TrainerCore {
       return;
     }
 
-    const obs = engine.buildObs();
+    // ONNX braucht exakte Basis-Dimension; ES-MLP ggf. +2 (Imitations-Phase)
+    const obs = policy instanceof MlpPolicy
+      ? engine.obsFor(this.esObsExtra >= 2)
+      : engine.obsFor(false);
     const act = policy instanceof MlpPolicy
       ? policy.forward(obs, this.actBuf)
       : await policy.forward(obs);
@@ -574,6 +845,21 @@ export class TrainerCore {
       return;
     }
 
+    // v2.1: Punkt-Modus – cmd Richtung Punkt (für ES-Obs)
+    if (this.pointMode && engine.targetPoint) {
+      const [tx, ty] = engine.targetPoint;
+      const p = engine.torsoPos();
+      const dx = tx - p[0], dy = ty - p[1];
+      const dist = Math.hypot(dx, dy);
+      const yaw = engine.yaw();
+      const desired = Math.atan2(dy, dx);
+      let yerr = desired - yaw;
+      while (yerr > Math.PI) yerr -= 2 * Math.PI;
+      while (yerr < -Math.PI) yerr += 2 * Math.PI;
+      engine.cmd[0] = dist > 0.15 ? 0.35 * Math.max(0, Math.cos(yerr)) : 0;
+      engine.cmd[2] = clamp(1.2 * yerr, -1, 1);
+    }
+
     // Training/Test: ES-Policy (G1 hat keine ONNX-Policies)
     const mlp = this.esView;
     if (!mlp || !this.g1Base) {
@@ -582,7 +868,7 @@ export class TrainerCore {
       engine.stepPhysics();
       return;
     }
-    const obs = engine.buildObs();
+    const obs = engine.obsFor(this.esObsExtra >= 2);
     const act = mlp.forward(obs, this.actBuf);
     engine.lastAction.set(act);
     engine.stepWithAction(act);
@@ -688,6 +974,16 @@ export class TrainerCore {
       es: this.trainer ? this.trainer.stats() : null,
       mappings: this.mappings,
       reward: this.rewardCfg ?? (this.modelId ? loadRewardConfig(this.modelId) : ({} as RewardConfig)),
+      world: this.worldCfg,
+      pointMode: this.pointMode,
+      point: [this.point[0], this.point[1]],
+      imitation: this.imitClip
+        ? {
+            name: this.imitClip.name, duration: this.imitClip.duration,
+            playing: this.imitPlaying, time: this.imitTime,
+            mapped: this.imitClip.mapped, manual: this.imitManual,
+          }
+        : null,
     };
     try {
       this.onTelemetry(t);
@@ -738,6 +1034,33 @@ export class TrainerCore {
     this.world = null;
     this.booted = false;
   }
+}
+
+// ── v2.1: Persistenz (Welt + Punkt-Modus) ────────────────────────────────────
+
+function loadWorldPrefs(): WorldConfig {
+  try {
+    const raw = localStorage.getItem("mdt_v2_world");
+    if (raw) {
+      const p = JSON.parse(raw) as WorldConfig;
+      if (p && typeof p.seed === "number") {
+        return { ...defaultWorldConfig(), ...p, features: { ...defaultWorldConfig().features, ...p.features } };
+      }
+    }
+  } catch { /* ignore */ }
+  return defaultWorldConfig();
+}
+
+function saveWorldPrefs(cfg: WorldConfig): void {
+  try { localStorage.setItem("mdt_v2_world", JSON.stringify(cfg)); } catch { /* ignore */ }
+}
+
+function loadPointPrefs(modelId: ModelId): boolean {
+  try { return localStorage.getItem(`mdt_v2_point_${modelId}`) === "1"; } catch { return false; }
+}
+
+function savePointPrefs(modelId: ModelId, on: boolean): void {
+  try { localStorage.setItem(`mdt_v2_point_${modelId}`, on ? "1" : "0"); } catch { /* ignore */ }
 }
 
 export default TrainerCore;

@@ -308,6 +308,10 @@ export interface World {
   ball: THREE.Mesh;
   setCameraTarget: (x: number, y: number, z: number) => void;
   updateCamera: (dt: number) => void;
+  /** v2.1: Welt-Objekte (Treppen, Hügel …) als Gruppe setzen/entfernen. */
+  setWorldProps: (group: THREE.Group | null) => void;
+  /** v2.1: Joystick-Punkt-Marker setzen (Punkt-Modus). */
+  setTargetPoint: (x: number, y: number, visible: boolean) => void;
   dispose: () => void;
 }
 
@@ -376,6 +380,26 @@ export async function createWorld(container: HTMLElement): Promise<World> {
   const robotRoot = new THREE.Group();
   scene.add(robotRoot);
 
+  // v2.1: Punkt-Marker (glühender Ring + Kern) für den Punkt-Modus
+  const marker = new THREE.Group();
+  const markerRing = new THREE.Mesh(
+    new THREE.TorusGeometry(0.09, 0.014, 10, 36),
+    new THREE.MeshStandardMaterial({ color: 0xff9a3c, emissive: 0xff6a00, emissiveIntensity: 1.4, roughness: 0.4 }),
+  );
+  markerRing.rotation.x = Math.PI / 2;
+  const markerDot = new THREE.Mesh(
+    new THREE.SphereGeometry(0.03, 14, 10),
+    new THREE.MeshStandardMaterial({ color: 0xffd28a, emissive: 0xff8c00, emissiveIntensity: 1.8 }),
+  );
+  marker.add(markerRing, markerDot);
+  marker.position.y = 0.03;
+  marker.visible = false;
+  scene.add(marker);
+  const worldProps = new THREE.Group();
+  worldProps.name = "world_props_root";
+  scene.add(worldProps);
+  let markerPulse = 0;
+
   let duckRig: DuckRig | null = null;
   let g1Rig: G1Rig | null = null;
 
@@ -426,7 +450,20 @@ export async function createWorld(container: HTMLElement): Promise<World> {
     setCameraTarget(x, y, z) {
       target.set(x, y, z);
     },
+    setWorldProps(group) {
+      for (const c of [...worldProps.children]) worldProps.remove(c);
+      if (group) worldProps.add(group);
+    },
+    setTargetPoint(x, y, visible) {
+      marker.visible = visible;
+      if (visible) marker.position.set(x, 0.03, -y);
+    },
     updateCamera(dt) {
+      if (marker.visible) {
+        markerPulse += dt * 5;
+        const k = 1 + Math.sin(markerPulse) * 0.12;
+        markerRing.scale.setScalar(k);
+      }
       smoothTarget.lerp(target, Math.min(1, dt * 6));
       const cp = new THREE.Vector3(
         smoothTarget.x + camSph.dist * Math.cos(camSph.pitch) * Math.cos(camSph.yaw),

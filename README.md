@@ -1,6 +1,15 @@
-# 🦆 MicroDuck Trainer v2.0
+# 🦆 MicroDuck Trainer v2.1
 
 MuJoCo-Roboter-Training direkt auf dem Android-Handy – **komplett offline**. Enthält die **Original-MicroDuck-Ente** aus dem HF-Space `pollen-robotics/microduck-simulator` (MJCF, GLB, 9 ONNX-Policies) und den **Unitree G1** aus `google-deepmind/mujoco_menagerie`.
+
+## Features (v2.1 – NEU)
+
+| Feature | Beschreibung |
+|---|---|
+| 🌍 **Random-Welt-Generator** | Prozedurale Welten per Knopfdruck neu würfeln: **Treppen, Hügel, Löcher** (Fliesenboden), **Hindernisse**, **Balancierstange** – mit Schwierigkeit + Dichte-Reglern und Seed |
+| 🎬 **GLB-Animations-Imitation** | Eigene `.glb`-Animationen hochladen (z. B. Mixamo) → Knochen werden automatisch auf die Roboter-Gelenke gemappt → die ES lernt sie nachzumachen (Phase sin/cos in der Observation, Test-Modus spielt endlos ohne Reset) |
+| 🎯 **Punkt-Modus** | Der Joystick bewegt einen **3D-Punkt** in der Welt – die Trainingsregeln bestimmen, wie (und ob) der Roboter reagiert: „Zum Punkt laufen", „Vom Punkt weg" |
+| 🤖 **Gemini-Trainingsregeln** | Ziel in normalem Deutsch sagen („Ich will, dass der Roboter springen lernt") → **gemini-robotics-er-2-preview**, **gemini-3.5-flash-lite** oder **gemini-3.8-flash** passen Reward, Welt, Punkt-Modus und Turbo automatisch an – ganz ohne Programmieren |
 
 ## Features (v2.0)
 
@@ -18,11 +27,16 @@ MuJoCo-Roboter-Training direkt auf dem Android-Handy – **komplett offline**. E
 
 ## Installation
 
-1. `MicroDuckTrainer-v2.0.apk` aus den [Releases](https://github.com/KilllerBoss/MicroDuckTrainer/releases/latest) herunterladen
+1. `MicroDuckTrainer-v2.1.apk` aus den [Releases](https://github.com/KilllerBoss/MicroDuckTrainer/releases/latest) herunterladen
 2. Installieren („Unbekannte Quellen" erlauben)
 3. App startet offline mit Tron-Arena + Ente
 
-> **Hinweis v1.0 → v2.0:** v2.0 ist neu signiert – vor der Installation die alte v1.0-App deinstallieren.
+> **Update v2.0 → v2.1:** Gleiche Signatur – kann direkt **über** v2.0 installiert werden.
+> **Hinweis v1.0 → v2.x:** v1.0 hatte eine andere Signatur – v1.0 vorher deinstallieren.
+
+### Gemini einrichten (optional)
+1. Kostenlos einen API-Key erstellen: [aistudio.google.com](https://aistudio.google.com) → „Get API key"
+2. In der App: **KI**-Panel → Key eintragen (wird nur lokal gespeichert) → Modell wählen → Ziel beschreiben → „Regeln automatisch anpassen"
 
 ## Nutzung
 
