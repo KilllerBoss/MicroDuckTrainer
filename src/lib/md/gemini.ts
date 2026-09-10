@@ -1,6 +1,8 @@
-// ── MicroDuck Trainer v2.1 – Gemini-Trainingsassistent ───────────────────────
-// Nimmt ein Ziel in natürlicher Sprache („Ich will, dass der Roboter springen
-// lernt") und passt Reward-Terme, Punkt-Modus, Welt und Turbo automatisch an.
+// ── MicroDuck Trainer v2.2 – Gemini-Trainingsassistent ───────────────────────
+// Zwei Modi:
+//  1) REGELN: Reward-Terme, Punkt-Modus, Welt, Turbo anpassen (kein Code).
+//  2) CODE-EXPERTE: Gemini schreibt selbst JavaScript-Trainings-Code und
+//     entscheidet Rundenlänge + Ziel-Generationen + Turbo + Reset.
 // Modelle: gemini-robotics-er-2-preview · gemini-3.5-flash-lite · gemini-3.8-flash
 // Läuft direkt im Client (generativelanguage.googleapis.com erlaubt CORS).
 
@@ -8,6 +10,7 @@ import type { ModelId } from "./models";
 import { getModel } from "./models";
 import { REWARD_TERMS, type RewardConfig } from "./rewards";
 import type { WorldFeatures } from "./worldgen";
+import { validateCustomCode } from "./customcode";
 
 /** Standard-Key (vom Nutzer bereitgestellt); kann in der UI überschrieben werden. */
 export const DEFAULT_GEMINI_KEY = "AIzaSyCl2mYBoobRRIneTUdJa2FFIF-BGj4iqrg";
@@ -44,6 +47,20 @@ export interface GeminiPatch {
   turbo?: number; // 1 | 4 | 16 | 32 | 64
   resetFirst?: boolean; // Training von Null starten (z. B. bei neuem Bewegungsziel)
   explanation?: string;
+  // ── v2.2: Code-Experte ──
+  /** Reward-Code (JS-Funktionskörper, `return` einer Zahl). */
+  code?: string;
+  codeName?: string;
+  codeWeight?: number;
+  /** Trainings-Einstellungen, die Gemini entscheiden darf. */
+  training?: {
+    rolloutSteps?: number;
+    generations?: number;
+    lr?: number;
+    sigma?: number;
+    turbo?: number;
+    resetFirst?: boolean;
+  };
 }
 
 export interface GeminiContext {
@@ -64,14 +81,34 @@ const TERM_DOCS = REWARD_TERMS.map(
     (t.hasParam ? ` · Param "${t.paramLabel}" ${t.paramMin}..${t.paramMax}` : ""),
 ).join("\n");
 
-function buildPrompt(ctx: GeminiContext, goal: string): string {
+// ── API-Dokumentation für den Code-Modus ──
+const CODE_API_DOC = `Das Objekt "api" (jeder Aufruf = 1 Policy-Schritt, 50 Hz):
+  api.h / api.height : Körperhöhe in Meter (Zahl)
+  api.upZ            : 0..1, wie aufrecht der Roboter ist (1 = perfekt)
+  api.gz             : -1..1, Schwerkraft-Projektion (-1 = aufrecht)
+  api.vx             : Vorwärtsgeschwindigkeit m/s (Roboter-Sicht)
+  api.vy             : Seitwärts-Geschwindigkeit m/s
+  api.vz             : Vertikal-Geschwindigkeit m/s (positiv = steigt! für Sprünge)
+  api.omega          : Gierrate rad/s
+  api.angles         : Float32Array Gelenkwinkel (rad, ein Wert pro Gelenk)
+  api.act / api.prevAct : Float32Array Aktionen -1..1 (aktuell / vorheriger Schritt)
+  api.qpos, api.qvel, api.qacc : Float32Array volle MuJoCo-Zustände (api.qvel[2] = vz)
+  api.torso          : [x, y, z] Position in der Welt (Meter)
+  api.target         : [x, y] Joystick-Punkt in der Welt oder null
+  api.cmd            : Float32Array [vx, vy, yaw] Kommandos
+  api.imitDelta      : number | null – Root-Höhen-Delta der GLB-Animation
+  api.imitTarget     : Float32Array | null – Ziel-Gelenkwinkel der GLB-Animation
+  api.dt             : Sekunden pro Schritt (0.02)
+  api.t              : Zeit im Rollout (Sekunden)
+  api.step           : Schritt-Index im Rollout (0, 1, 2, ...)`;
+
+function commonContext(ctx: GeminiContext): string {
   const meta = getModel(ctx.modelId);
   const cur = Object.entries(ctx.reward.terms)
     .filter(([, v]) => v.enabled)
     .map(([k, v]) => `${k}(w=${v.weight.toFixed(2)}${v.param ? `,p=${v.param.toFixed(2)}` : ""})`)
     .join(", ");
-  return `Du bist der Trainingsregeln-Assistent einer Roboter-Simulation (MuJoCo + Evolution-Strategy-Training im Browser).
-Roboter: ${meta.label} mit ${meta.actionDim} Gelenken (Positionsaktuatoren, Policy 50 Hz).
+  return `Roboter: ${meta.label} mit ${meta.actionDim} Gelenken (Positionsaktuatoren, Policy 50 Hz).
 Aktive Reward-Terme: ${cur || "keine"}
 Training: ${ctx.generation} Generationen bisher. Imitation einer GLB-Animation aktiv: ${ctx.imitationActive ? `ja (${ctx.imitationName})` : "nein"}.
 Random-Welt (Treppen/Hügel/Löcher/Hindernisse/Balancierstange) aktiv: ${ctx.worldEnabled ? "ja" : "nein"}.
@@ -79,7 +116,12 @@ Punkt-Modus (Joystick bewegt einen 3D-Punkt, kamera-relativ): aktuell "${ctx.poi
   - "aus": kein Punkt (klassische Joystick-Steuerung)
   - "frei": Punkt frei in der Arena, Roboter verfolgt ihn
   - "umkreis": Punkt bleibt im Radius um den Roboter
-  - "pfad": Roboter folgt einem physikalisch berechneten Pfad mit Schwung (Momentum) zum Punkt
+  - "pfad": Roboter folgt einem physikalisch berechneten Pfad mit Schwung (Momentum) zum Punkt`;
+}
+
+function buildPrompt(ctx: GeminiContext, goal: string): string {
+  return `Du bist der Trainingsregeln-Assistent einer Roboter-Simulation (MuJoCo + Evolution-Strategy-Training im Browser).
+${commonContext(ctx)}
 
 VERFÜGBARE REWARD-TERME:
 ${TERM_DOCS}
@@ -96,22 +138,17 @@ Antworte AUSSCHLIESSLICH mit JSON (kein Markdown) nach diesem Schema:
 {"reward":{"<termId>":{"enabled":bool,"weight":number,"param":number}},"point":{"mode":"frei","radius":1.5,"speedByDist":true,"maxSpeed":0.25,"fullDist":1.5},"world":{"enabled":bool,"difficulty":number,"density":number,"features":{"treppen":bool,"huegel":bool,"loecher":bool,"hindernisse":bool,"stange":bool}},"turbo":1,"resetFirst":bool,"explanation":"max. 4 Sätze, Deutsch, warum diese Regeln zum Ziel führen"}`;
 }
 
-export async function applyGoalWithGemini(
-  apiKey: string,
-  model: GeminiModelId,
-  ctx: GeminiContext,
-  goal: string,
-): Promise<{ patch: GeminiPatch; raw: string }> {
+async function callGemini(apiKey: string, model: string, prompt: string, maxTokens: number): Promise<string> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: buildPrompt(ctx, goal) }] }],
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: {
         temperature: 0.4,
         responseMimeType: "application/json",
-        maxOutputTokens: 2048,
+        maxOutputTokens: maxTokens,
       },
     }),
   });
@@ -136,7 +173,70 @@ export async function applyGoalWithGemini(
   const text: string =
     data?.candidates?.[0]?.content?.parts?.map((p: any) => p.text ?? "").join("") ?? "";
   if (!text.trim()) throw new Error("Gemini lieferte eine leere Antwort.");
+  return text;
+}
+
+/** Modus 1: Trainingsregeln anpassen (kein Code). */
+export async function applyGoalWithGemini(
+  apiKey: string,
+  model: GeminiModelId,
+  ctx: GeminiContext,
+  goal: string,
+): Promise<{ patch: GeminiPatch; raw: string }> {
+  const text = await callGemini(apiKey, model, buildPrompt(ctx, goal), 2048);
+  return { patch: parsePatch(text), raw: text };
+}
+
+function buildCodePrompt(ctx: GeminiContext, goal: string, currentCode: string | null): string {
+  return `Du bist der Trainings-Code-Autor einer Roboter-Simulation (MuJoCo + Evolution-Strategy im Browser). Du schreibst selbst JavaScript-Trainingscode und entscheidest über alles: Reward-Code, Rundenlänge (rolloutSteps), Anzahl Generationen (generations), Turbo und ob das Training bei Null starten muss.
+${commonContext(ctx)}
+${currentCode ? `AKTUELL AKTIVER CODE (vom vorherigen Lauf, kann verbessert werden):
+
+\`\`\`${currentCode}
+\`\`\`
+
+` : ""}REWARD-CODE-API (dein Code erhält pro Schritt ein Objekt "api"):
+${CODE_API_DOC}
+
+REGELN FÜR DEN CODE:
+- Der Code ist ein Funktionskörper; er MUSS mit "return" eine einzelne Zahl zurückgeben (Reward-Beitrag; typisch 0..3, negative Werte = Strafe).
+- Maximal ~40 Zeilen, nur reines JavaScript (Math, if, for). VERBOTEN: import, fetch, eval, DOM, window, document, localStorage, while(true).
+- Der Code wird pro Physik-Schritt (50 Hz) ausgeführt – halte ihn billig.
+- Beispiele:
+  Springen unterstützen:  let bonus = Math.max(0, api.vz) * 3; bonus += Math.max(0, api.h - 0.35) * 8; return bonus;
+  Zum Punkt eilen:       if (!api.target) return 0; const dx = api.torso[0]-api.target[0], dy = api.torso[1]-api.target[1]; return Math.exp(-(dx*dx+dy*dy)/0.5) * 2;
+  Ruhig stehen:          return api.upZ * 1.5 - Math.abs(api.vx) * 2 - Math.abs(api.omega) * 0.5;
+
+ENTSCHEIDUNGEN (du entscheidest alles):
+- rolloutSteps: Rundenlänge in Policy-Schritten (50 = kurz, 200 = Standard, 600 = sehr lang; für Sprünge 300-400).
+- generations: Ziel-Generationen, nach denen das Training automatisch stoppt (einfach 300-800, schwer 1500-3000; 0 = unbegrenzt).
+- turbo: 1=stabil, 4, 16=schnell, 32, 64=maximal.
+- resetFirst: true bei grundlegend neuem Bewegungsmuster (z. B. Gehen → Springen).
+- weight: Gewichtung des Code-Terms (1 = normal, 2-5 = dominanter, negativ = Strafe).
+
+ZIEL DES NUTZERS: "${goal}"
+
+Antworte AUSSCHLIESSLICH mit JSON (kein Markdown, Code als EIN JSON-String mit \\n-Zeilenumbrüchen):
+{"name":"kurzer deutscher Name","weight":2.0,"code":"let bonus = ...; return bonus;","training":{"rolloutSteps":300,"generations":800,"turbo":16,"lr":0.03,"sigma":0.08,"resetFirst":true},"reward":{"<termId>":{"enabled":bool,"weight":number,"param":number}},"point":{"mode":"frei"},"world":{"enabled":bool},"explanation":"max. 4 Sätze Deutsch: was dein Code belohnt und warum die Runden-Einstellungen passen"}`;
+}
+
+/** Modus 2: Gemini schreibt den Trainings-Code selbst (v2.2). */
+export async function applyCodeWithGemini(
+  apiKey: string,
+  model: GeminiModelId,
+  ctx: GeminiContext,
+  goal: string,
+  currentCode: string | null,
+): Promise<{ patch: GeminiPatch; raw: string }> {
+  const text = await callGemini(apiKey, model, buildCodePrompt(ctx, goal, currentCode), 8192);
   const patch = parsePatch(text);
+  if (!patch.code) {
+    throw new Error("Gemini hat keinen Code geliefert – nochmal versuchen oder Regeln-Modus nutzen.");
+  }
+  const err = validateCustomCode(patch.code);
+  if (err) {
+    throw new Error(`Gemini-Code unbrauchbar: ${err} – erneut versuchen oder Modell wechseln.`);
+  }
   return { patch, raw: text };
 }
 
@@ -199,6 +299,22 @@ export function parsePatch(text: string): GeminiPatch {
   if ([1, 4, 16, 32, 64].includes(obj.turbo)) patch.turbo = obj.turbo;
   if (typeof obj.resetFirst === "boolean") patch.resetFirst = obj.resetFirst;
   if (typeof obj.explanation === "string") patch.explanation = obj.explanation;
+  // ── v2.2: Code-Experte ──
+  if (typeof obj.code === "string" && obj.code.trim()) {
+    patch.code = obj.code.replace(/\r/g, "").slice(0, 4000);
+  }
+  if (typeof obj.name === "string" && obj.name.trim()) patch.codeName = obj.name.trim().slice(0, 40);
+  if (Number.isFinite(obj.weight)) patch.codeWeight = clampNum(obj.weight, -20, 20);
+  if (obj.training && typeof obj.training === "object") {
+    const tr: NonNullable<GeminiPatch["training"]> = {};
+    if (Number.isFinite(obj.training.rolloutSteps)) tr.rolloutSteps = clampNum(Math.round(obj.training.rolloutSteps), 30, 1000);
+    if (Number.isFinite(obj.training.generations)) tr.generations = clampNum(Math.round(obj.training.generations), 0, 100000);
+    if (Number.isFinite(obj.training.lr)) tr.lr = clampNum(obj.training.lr, 0.002, 0.2);
+    if (Number.isFinite(obj.training.sigma)) tr.sigma = clampNum(obj.training.sigma, 0.005, 0.3);
+    if ([1, 4, 16, 32, 64].includes(obj.training.turbo)) tr.turbo = obj.training.turbo;
+    if (typeof obj.training.resetFirst === "boolean") tr.resetFirst = obj.training.resetFirst;
+    if (Object.keys(tr).length) patch.training = tr;
+  }
   return patch;
 }
 

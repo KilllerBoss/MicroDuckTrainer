@@ -1,5 +1,5 @@
 #!/bin/bash
-# MicroDuck Trainer v2.1 – APK-Build ohne Android Studio
+# MicroDuck Trainer v2.2 – APK-Build ohne Android Studio
 # Schritte: Icons → javac → D8 → aapt2 link (+90MB Assets) → DEX einfügen → zipalign → signieren
 set -e
 cd /home/z/my-project
@@ -11,9 +11,9 @@ R8=$PWD/scripts/android-sdk/r8.jar
 APK=scripts/apk
 OUT=$PWD/out
 BUILD=$PWD/scripts/apk/build-v2
-VERSION_CODE=3
-VERSION_NAME=2.1
-FINAL=download/MicroDuckTrainer-v2.1.apk
+VERSION_CODE=4
+VERSION_NAME=2.2
+FINAL=download/MicroDuckTrainer-v2.2.apk
 
 rm -rf "$BUILD"
 mkdir -p "$BUILD/classes" "$BUILD/dexout" download

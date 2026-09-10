@@ -1,15 +1,18 @@
 "use client";
 
-// ── MicroDuck Trainer v2.0 – Trainings-Panel (OpenAI-ES) ─────────────────────
+// ── MicroDuck Trainer v2.2 – Trainings-Panel (OpenAI-ES) ─────────────────────
 
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
+import { Slider } from "@/components/ui/slider";
 import FitnessChart from "./FitnessChart";
 import type { Telemetry } from "@/lib/md/app-core";
 import { TURBO_LEVELS, type TurboLevel } from "@/lib/md/es";
-import { Play, Square, Eye, Save, FolderOpen } from "lucide-react";
+import {
+  Play, Square, Eye, Save, FolderOpen, Download, Upload, Timer,
+} from "lucide-react";
 
 interface TrainingPanelProps {
   tel: Telemetry;
@@ -21,6 +24,10 @@ interface TrainingPanelProps {
   onSave: () => void;
   onLoad: () => void;
   hasSaved: boolean;
+  // v2.2
+  onTrainCfg: (patch: Partial<Telemetry["trainCfg"]>) => void;
+  onExport: () => void;
+  onImport: () => void;
 }
 
 function fmt(n: number | undefined | null, digits = 2): string {
@@ -29,9 +36,16 @@ function fmt(n: number | undefined | null, digits = 2): string {
 }
 
 export default function TrainingPanel(props: TrainingPanelProps) {
-  const { tel, turbo, onTurbo, onStart, onStop, onShowBest, onSave, onLoad, hasSaved } = props;
+  const {
+    tel, turbo, onTurbo, onStart, onStop, onShowBest, onSave, onLoad, hasSaved,
+    onTrainCfg, onExport, onImport,
+  } = props;
   const es = tel.es;
   const [watchBest, setWatchBest] = useState(false);
+  const cfg = tel.trainCfg;
+  const genProgress = cfg.maxGenerations > 0 && es
+    ? Math.min(100, (es.generation / cfg.maxGenerations) * 100)
+    : null;
 
   return (
     <div className="space-y-4">
@@ -104,7 +118,7 @@ export default function TrainingPanel(props: TrainingPanelProps) {
           { label: "Generation", value: es ? String(es.generation) : "–" },
           { label: "Best (Gen)", value: es ? fmt(es.bestFitness) : "–" },
           { label: "Best ever", value: es ? fmt(es.bestEver) : "–" },
-          { label: "Sigma", value: es ? fmt(es.sigma, 3) : "0.080" },
+          { label: "Sigma", value: es ? fmt(es.sigma, 3) : fmt(cfg.sigma, 3) },
           { label: "Schritte/s", value: es ? fmt(es.stepsPerSec, 0) : "–" },
           { label: "Sturzrate", value: es ? fmt(es.fellRate, 2) : "–" },
         ].map((s) => (
@@ -117,6 +131,93 @@ export default function TrainingPanel(props: TrainingPanelProps) {
 
       {/* Chart */}
       <FitnessChart history={es?.history ?? []} />
+
+      {/* v2.2: Ziel-Generationen Fortschritt */}
+      {genProgress !== null && (
+        <div>
+          <div className="mb-1 flex justify-between text-[11px] text-slate-400">
+            <span className="flex items-center gap-1">
+              <Timer className="h-3 w-3" /> Ziel: {cfg.maxGenerations} Generationen
+            </span>
+            <span className="font-mono text-cyan-300">{es?.generation ?? 0} / {cfg.maxGenerations}</span>
+          </div>
+          <div className="h-1.5 overflow-hidden rounded-full bg-black/40">
+            <div className="h-full rounded-full bg-cyan-400 transition-all" style={{ width: `${genProgress}%` }} />
+          </div>
+        </div>
+      )}
+
+      {/* v2.2: Runden & Hyperparameter */}
+      <div className="space-y-3 rounded-lg border border-cyan-500/20 bg-black/20 p-3">
+        <div className="text-xs font-semibold text-cyan-300">Runden &amp; Hyperparameter</div>
+
+        <div>
+          <div className="mb-1 flex justify-between text-[11px] text-slate-400">
+            <span>Rundenlänge (Schritte je Runde)</span>
+            <span className="font-mono text-cyan-300">{cfg.rolloutSteps}</span>
+          </div>
+          <Slider
+            value={[cfg.rolloutSteps]}
+            min={30}
+            max={600}
+            step={10}
+            onValueChange={(v) => onTrainCfg({ rolloutSteps: v[0] })}
+          />
+          <p className="mt-0.5 text-[10px] text-slate-600">
+            Längere Runden = reiferes Verhalten, aber langsamer je Generation.
+          </p>
+        </div>
+
+        <div>
+          <div className="mb-1 flex justify-between text-[11px] text-slate-400">
+            <span>Ziel-Generationen (Auto-Stopp)</span>
+            <span className="font-mono text-cyan-300">
+              {cfg.maxGenerations === 0 ? "∞ (manuell stoppen)" : String(cfg.maxGenerations)}
+            </span>
+          </div>
+          <Slider
+            value={[cfg.maxGenerations]}
+            min={0}
+            max={3000}
+            step={25}
+            onValueChange={(v) => onTrainCfg({ maxGenerations: v[0] })}
+          />
+          <p className="mt-0.5 text-[10px] text-slate-600">
+            Training stoppt automatisch, wenn das Ziel erreicht ist. 0 = unbegrenzt.
+          </p>
+        </div>
+
+        <div>
+          <div className="mb-1 flex justify-between text-[11px] text-slate-400">
+            <span>Lernrate</span>
+            <span className="font-mono text-cyan-300">{cfg.lr.toFixed(3)}</span>
+          </div>
+          <Slider
+            value={[cfg.lr]}
+            min={0.005}
+            max={0.1}
+            step={0.005}
+            onValueChange={(v) => onTrainCfg({ lr: v[0] })}
+          />
+        </div>
+
+        <div>
+          <div className="mb-1 flex justify-between text-[11px] text-slate-400">
+            <span>Rauschen (Sigma)</span>
+            <span className="font-mono text-cyan-300">{cfg.sigma.toFixed(3)}</span>
+          </div>
+          <Slider
+            value={[cfg.sigma]}
+            min={0.01}
+            max={0.2}
+            step={0.005}
+            onValueChange={(v) => onTrainCfg({ sigma: v[0] })}
+          />
+          <p className="mt-0.5 text-[10px] text-slate-600">
+            Mehr Rauschen = mehr Entdeckung, weniger Feinschliff.
+          </p>
+        </div>
+      </div>
 
       {/* Aktionen */}
       <div className="grid grid-cols-2 gap-2">
@@ -155,10 +256,29 @@ export default function TrainingPanel(props: TrainingPanelProps) {
           <FolderOpen className="h-4 w-4" /> Laden
         </Button>
       </div>
+
+      {/* v2.2: Export/Import als Datei (APK: Downloads-Ordner / Dateimanager) */}
+      <div className="grid grid-cols-2 gap-2">
+        <Button
+          variant="outline"
+          onClick={onExport}
+          className="h-11 gap-1.5 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10"
+        >
+          <Download className="h-4 w-4" /> Export (.json)
+        </Button>
+        <Button
+          variant="outline"
+          onClick={onImport}
+          className="h-11 gap-1.5 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10"
+        >
+          <Upload className="h-4 w-4" /> Import (.json)
+        </Button>
+      </div>
       <p className="text-[11px] leading-relaxed text-slate-500">
         OpenAI-ES mit antithetischem Sampling (24–96 Individuen je Turbo-Stufe), adaptivem
-        Sigma und Rank-Shaping. „Speichern/Laden“ nutzt den lokalen Speicher des Geräts –
-        perfekt für die APK.
+        Sigma und Rank-Shaping. „Speichern/Laden“ nutzt den lokalen Speicher; „Export/Import“
+        schreibt vollständige Trainingsstände (Policy + Regeln + Runden-Einstellungen) in den
+        Downloads-Ordner bzw. liest sie aus dem Dateimanager – perfekt zum Sichern und Teilen.
       </p>
     </div>
   );

@@ -15,6 +15,49 @@ let imitBuf = null;
 let policyDt = 0.02;
 let pointSnapshot = null; // [x, y] | null (Punkt-Modus, Snapshot je Eval)
 
+// ── v2.2: KI-Code-Term (identisch zu src/lib/md/customcode.ts) ──
+const FORBIDDEN = /\b(import|require|eval|Function|fetch|XMLHttpRequest|localStorage|sessionStorage|indexedDB|document|window|globalThis|self|postMessage|Worker|WebSocket)\b/;
+let customCacheKey = null;
+let customFn = null;
+let customWarned = false;
+
+function getCustomFn(code) {
+  if (customCacheKey === code) return customFn;
+  customCacheKey = code;
+  customFn = null;
+  try {
+    if (code && code.trim() && !FORBIDDEN.test(code)) {
+      const compiled = new Function("api", `"use strict";\n${code}\n`);
+      // Kaltstart-Check mit Dummy-API
+      const n = 8;
+      const probe = compiled({
+        h: 0.7, height: 0.7, upZ: 1, gz: -1, vx: 0, vy: 0, vz: 0, omega: 0,
+        angles: new Float32Array(n), act: new Float32Array(n), prevAct: new Float32Array(n),
+        qpos: new Float32Array(16), qvel: new Float32Array(16), qacc: new Float32Array(16),
+        torso: [0, 0, 0.7], target: null, cmd: new Float32Array([0, 0, 0]),
+        imitDelta: null, imitTarget: null, dt: 0.02, t: 0, step: 0,
+      });
+      if (typeof probe === "number" && Number.isFinite(probe)) customFn = compiled;
+    }
+  } catch {
+    customFn = null;
+  }
+  return customFn;
+}
+
+function evalCustomFn(fn, api) {
+  try {
+    const v = fn(api);
+    return Number.isFinite(v) ? v : 0;
+  } catch (err) {
+    if (!customWarned) {
+      customWarned = true;
+      console.warn("[custom-reward] Laufzeitfehler (Term liefert 0):", err);
+    }
+    return 0;
+  }
+}
+
 const BALL_RADIUS = 0.05;
 
 function post(msg, transfer) {
@@ -254,6 +297,20 @@ function runRollout(theta, layout, reward, steps, targetPoint) {
   const lastAction = new Float32Array(layout.actionDim);
   const cmd = new Float32Array(ctx.cmdSize);
   const T = reward.terms;
+  // v2.2: wiederverwendetes API-Objekt für den KI-Code-Term (kein GC-Druck)
+  const customTerm = reward.custom;
+  const customUse = !!(customTerm && customTerm.enabled && customTerm.code);
+  const customFnLocal = customUse ? getCustomFn(customTerm.code) : null;
+  const api = customUse && customFnLocal ? {
+    h: 0, height: 0, upZ: 0, gz: 0, vx: 0, vy: 0, vz: 0, omega: 0,
+    angles: new Float32Array(layout.actionDim),
+    act, prevAct,
+    qpos: null, qvel: null, qacc: null,
+    torso: [0, 0, 0], target: null,
+    cmd,
+    imitDelta: null, imitTarget: null,
+    dt: policyDt, t: 0, step: 0,
+  } : null;
   let sum = 0, n = 0, fell = false;
   let tImit = 0; // Imitations-Zeit (s)
   for (let t = 0; t < steps; t++) {
@@ -354,6 +411,22 @@ function runRollout(theta, layout, reward, steps, targetPoint) {
       if (T.pointAvoid?.enabled) {
         val += T.pointAvoid.weight * Math.min(1, d / Math.max(0.05, T.pointAvoid.param));
       }
+    }
+    // ── v2.2: KI-Code-Term (identisch zur Main-Thread-Variante) ──
+    if (api && customFnLocal) {
+      const torsoX = data.body(addrs.torsoId).xpos;
+      api.h = hh; api.height = hh;
+      api.upZ = upZ; api.gz = gz;
+      api.vx = vx; api.vy = vy; api.vz = qvel[2] ?? 0; api.omega = omega;
+      const ang = api.angles;
+      for (let j = 0; j < addrs.qposAdr.length; j++) ang[j] = qpos0[addrs.qposAdr[j]];
+      api.qpos = qpos0; api.qvel = qvel; api.qacc = data.qacc;
+      api.torso[0] = torsoX[0]; api.torso[1] = torsoX[1]; api.torso[2] = torsoX[2];
+      api.target = pointSnapshot ? [pointSnapshot[0], pointSnapshot[1]] : null;
+      api.imitDelta = imitRootDelta;
+      api.imitTarget = imitTarget;
+      api.t = tImit; api.step = n;
+      val += customTerm.weight * evalCustomFn(customFnLocal, api);
     }
     sum += val;
     tImit += policyDt;

@@ -7,12 +7,13 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { toast } from "@/hooks/use-toast";
 import { Button } from "@/components/ui/button";
-import TrainerCore, { type Telemetry, type PointCfg } from "@/lib/md/app-core";
+import TrainerCore, { type Telemetry, type PointCfg, type TrainCfg } from "@/lib/md/app-core";
 import type { ModelId } from "@/lib/md/models";
 import { getModel } from "@/lib/md/models";
 import { TURBO_LEVELS, type TurboLevel } from "@/lib/md/es";
 import type { MappingEntry } from "@/lib/md/mapping";
 import type { RewardConfig } from "@/lib/md/rewards";
+import { saveToDevice, initFileSavedListener } from "@/lib/md/fileio";
 import GamepadOverlay from "./GamepadOverlay";
 import TrainingPanel from "./TrainingPanel";
 import RewardPanel from "./RewardPanel";
@@ -22,10 +23,26 @@ import AnimationPanel from "./AnimationPanel";
 import GeminiPanel from "./GeminiPanel";
 import {
   Maximize, Gamepad2, Dumbbell, Star, SlidersHorizontal, RotateCcw,
-  AlertTriangle, Loader2, Mountain, Film, Bot,
+  AlertTriangle, Loader2, Mountain, Film, Bot, Menu, Download, Upload,
 } from "lucide-react";
 
 type PanelId = "training" | "reward" | "control" | "world" | "animation" | "ki" | null;
+
+/** v2.2: alle Panels im Vollbild-Men – Topbar bleibt schlank (Mobil). */
+const MENU_ITEMS: {
+  id: Exclude<PanelId, null>;
+  label: string;
+  desc: string;
+  icon: typeof Dumbbell;
+  ki?: boolean;
+}[] = [
+  { id: "training", label: "Training", desc: "Start/Stopp, Turbo, Runden, Export/Import", icon: Dumbbell },
+  { id: "ki", label: "KI-Trainingsregeln", desc: "Gemini passt Regeln an oder schreibt selbst Code", icon: Bot, ki: true },
+  { id: "reward", label: "Bewertung", desc: "Reward-Terme & Gewichte", icon: Star },
+  { id: "control", label: "Steuerung", desc: "Joystick-Punkt, Aktion-Mapping, Gamepad", icon: SlidersHorizontal },
+  { id: "world", label: "Welt", desc: "Zufallswelt: Treppen, Hügel, Löcher, Hindernisse", icon: Mountain },
+  { id: "animation", label: "Animation", desc: "GLB hochladen & nachmachen lernen", icon: Film },
+];
 
 const MODE_LABELS: Record<string, string> = {
   manuell: "Manuell",
@@ -45,6 +62,8 @@ const INITIAL_TEL: Telemetry = {
   esReady: false, speed: 0, height: 0, ctrlHz: 0, recovering: false, fallen: false,
   testUptime: 0, testReward: 0, training: false, es: null, mappings: [],
   reward: { version: 2, terms: {} },
+  trainCfg: { rolloutSteps: 200, maxGenerations: 0, lr: 0.03, sigma: 0.08 },
+  customCode: null,
   world: { enabled: false, seed: 0, difficulty: 0.4, density: 0.5,
     features: { treppen: true, huegel: true, loecher: false, hindernisse: true, stange: false } },
   pointMode: false,
@@ -64,23 +83,37 @@ export default function TrainerApp() {
   const [autoRecovery, setAutoRecovery] = useState(true);
   const [turbo, setTurbo] = useState<TurboLevel>(1);
   const [hasSaved, setHasSaved] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
 
   const rootRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const coreRef = useRef<TrainerCore | null>(null);
   const loadingShown = useRef(false);
+  const importRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (!mounted || !containerRef.current || coreRef.current) return;
     const core = new TrainerCore();
     coreRef.current = core;
     core.onTelemetry = (t) => setTel(t);
+    core.onNotice = (title, message) => toast({ title, description: message });
     void core.boot(containerRef.current);
     return () => {
       core.dispose();
       coreRef.current = null;
     };
   }, [mounted]);
+
+  // v2.2: APK-Bridge meldet gespeicherte Dateien (Downloads-Ordner)
+  useEffect(() => {
+    return initFileSavedListener((ev) => {
+      toast({
+        title: ev.ok ? "Datei gespeichert" : "Speichern fehlgeschlagen",
+        description: ev.info,
+        variant: ev.ok ? undefined : "destructive",
+      });
+    });
+  }, []);
 
   // Lade-Toasts ("Lade Ente…" / "Lade G1 (29 Gelenke)…")
   useEffect(() => {
@@ -153,6 +186,7 @@ export default function TrainerApp() {
 
   const openPanel = useCallback((id: Exclude<PanelId, null>) => {
     setPanel((cur) => (cur === id ? null : id));
+    setMenuOpen(false);
     if (id === "training") {
       try { setHasSaved(coreRef.current?.hasSavedTheta() ?? false); } catch { setHasSaved(false); }
     }
@@ -201,6 +235,47 @@ export default function TrainerApp() {
 
   const onPointCfg = useCallback((patch: Partial<PointCfg>) => core()?.setPointCfg(patch), []);
 
+  // ── v2.2-Callbacks ──
+  const onTrainCfg = useCallback((patch: Partial<TrainCfg>) => core()?.setTrainCfg(patch), []);
+
+  // v2.2: Export als einfache Funktion (Telemetrie-Werte brauchen kein Memo)
+  const onExport = async () => {
+    const json = coreRef.current?.exportAll();
+    if (!json) {
+      toast({ title: "Export fehlgeschlagen", description: "App noch nicht bereit.", variant: "destructive" });
+      return;
+    }
+    try {
+      const gen = tel.es?.generation ?? 0;
+      const name = `mdt-export-${tel.modelId ?? "model"}-gen${gen}.json`;
+      const way = await saveToDevice(name, json, "application/json");
+      toast({
+        title: "Export erstellt",
+        description: way === "bridge"
+          ? `${name} landet im Downloads-Ordner.`
+          : `${name} wird heruntergeladen.`,
+      });
+    } catch (err: any) {
+      toast({ title: "Export fehlgeschlagen", description: err?.message || String(err), variant: "destructive" });
+    }
+  };
+
+  const onImportFile = useCallback(async (f: File | null) => {
+    if (!f) return;
+    try {
+      const txt = await f.text();
+      const r = await coreRef.current?.importAll(txt);
+      toast({
+        title: r?.ok ? "Import abgeschlossen" : "Import fehlgeschlagen",
+        description: r?.message || "Unbekanntes Ergebnis.",
+        variant: r?.ok ? undefined : "destructive",
+      });
+      try { setHasSaved(coreRef.current?.hasSavedTheta() ?? false); } catch { /* ignore */ }
+    } catch (err: any) {
+      toast({ title: "Import fehlgeschlagen", description: err?.message || String(err), variant: "destructive" });
+    }
+  }, []);
+
   const onGeminiPatch = useCallback((actions: {
     reward?: Telemetry["reward"];
     pointMode?: boolean;
@@ -208,10 +283,17 @@ export default function TrainerApp() {
     world?: Partial<Telemetry["world"]>;
     turbo?: number;
     resetFirst?: boolean;
+    custom?: RewardConfig["custom"] | { clear: true };
+    training?: Partial<TrainCfg>;
   }) => {
     const c = core();
     if (!c) return;
     if (actions.reward) c.setReward(actions.reward);
+    if (actions.custom) {
+      if ("clear" in actions.custom) c.setCustomTerm(null);
+      else c.setCustomTerm(actions.custom);
+    }
+    if (actions.training) c.setTrainCfg(actions.training);
     if (typeof actions.pointMode === "boolean") c.setPointMode(actions.pointMode);
     if (actions.pointCfg) c.setPointCfg(actions.pointCfg);
     if (actions.world) {
@@ -249,11 +331,12 @@ export default function TrainerApp() {
       {/* 3D-View */}
       <div ref={containerRef} className="absolute inset-0" aria-label="3D-Szene" />
 
-      {/* ── Topbar ── */}
+      {/* ── Topbar (v2.2: kompakt – alle Panels im ☰-Menü) ── */}
       <header className="relative z-40 border-b border-cyan-500/15 bg-[#0b0f18]/95 backdrop-blur">
-        <div className="flex items-center gap-1.5 px-2 py-1.5 sm:gap-2 sm:px-3">
-          <h1 className="mr-1 shrink-0 text-[13px] font-bold tracking-tight text-cyan-300 sm:text-sm">
-            <span aria-hidden>🦆</span> MicroDuck Trainer
+        <div className="flex items-center gap-1.5 px-2 py-1.5">
+          <h1 className="mr-0.5 shrink-0 text-[13px] font-bold tracking-tight text-cyan-300 sm:text-sm">
+            <span aria-hidden>🦆</span>
+            <span className="ml-1 hidden sm:inline">MicroDuck Trainer</span>
           </h1>
 
           {/* Modell-Switch */}
@@ -262,69 +345,27 @@ export default function TrainerApp() {
               type="button"
               onClick={() => switchModel("microduck")}
               disabled={tel.loading}
-              className={`h-9 px-2 text-xs transition-colors sm:px-3 ${
+              className={`h-9 px-2.5 text-xs transition-colors sm:px-3 ${
                 modelId === "microduck" ? "bg-cyan-500/25 text-cyan-200" : "text-slate-400 hover:bg-white/5"
               }`}
             >
-              🦆 <span className="hidden sm:inline">Ente</span>
+              🦆<span className="ml-1 hidden sm:inline">Ente</span>
             </button>
             <button
               type="button"
               onClick={() => switchModel("unitree_g1")}
               disabled={tel.loading}
-              className={`h-9 px-2 text-xs transition-colors sm:px-3 ${
+              className={`h-9 px-2.5 text-xs transition-colors sm:px-3 ${
                 modelId === "unitree_g1" ? "bg-cyan-500/25 text-cyan-200" : "text-slate-400 hover:bg-white/5"
               }`}
             >
-              🧍 <span className="hidden sm:inline">Mensch</span>
+              🧍<span className="ml-1 hidden sm:inline">Mensch</span>
             </button>
           </div>
 
           <div className="flex-1" />
 
-          {/* Panels */}
-          <Button
-            variant={panel === "training" ? "default" : "outline"}
-            onClick={() => openPanel("training")}
-            className={`h-9 gap-1 px-2 text-xs sm:px-3 ${panel === "training" ? "bg-cyan-500 text-black hover:bg-cyan-400" : "border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/10"}`}
-          >
-            <Dumbbell className="h-4 w-4" /> <span className="hidden md:inline">Training</span>
-          </Button>
-          <Button
-            variant={panel === "reward" ? "default" : "outline"}
-            onClick={() => openPanel("reward")}
-            className={`h-9 gap-1 px-2 text-xs sm:px-3 ${panel === "reward" ? "bg-cyan-500 text-black hover:bg-cyan-400" : "border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/10"}`}
-          >
-            <Star className="h-4 w-4" /> <span className="hidden md:inline">Bewertung</span>
-          </Button>
-          <Button
-            variant={panel === "control" ? "default" : "outline"}
-            onClick={() => openPanel("control")}
-            className={`h-9 gap-1 px-2 text-xs sm:px-3 ${panel === "control" ? "bg-cyan-500 text-black hover:bg-cyan-400" : "border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/10"}`}
-          >
-            <SlidersHorizontal className="h-4 w-4" /> <span className="hidden md:inline">Steuerung</span>
-          </Button>
-          <Button
-            variant={panel === "world" ? "default" : "outline"}
-            onClick={() => openPanel("world")}
-            className={`h-9 gap-1 px-2 text-xs sm:px-3 ${panel === "world" ? "bg-cyan-500 text-black hover:bg-cyan-400" : "border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/10"}`}
-          >
-            <Mountain className="h-4 w-4" /> <span className="hidden md:inline">Welt</span>
-          </Button>
-          <Button
-            variant={panel === "animation" ? "default" : "outline"}
-            onClick={() => openPanel("animation")}
-            className={`h-9 gap-1 px-2 text-xs sm:px-3 ${panel === "animation" ? "bg-cyan-500 text-black hover:bg-cyan-400" : "border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/10"}`}
-          >
-            <Film className="h-4 w-4" /> <span className="hidden md:inline">Animation</span>
-          </Button>
-          <Button
-            variant={panel === "ki" ? "default" : "outline"}
-            onClick={() => openPanel("ki")}
-            className={`h-9 gap-1 px-2 text-xs sm:px-3 ${panel === "ki" ? "bg-fuchsia-500 text-white hover:bg-fuchsia-400" : "border-fuchsia-500/40 text-fuchsia-300 hover:bg-fuchsia-500/10"}`}
-          >
-            <Bot className="h-4 w-4" /> <span className="hidden md:inline">KI</span>
-          </Button>
+          {/* Gamepad / Vollbild / Menü */}
           <Button
             variant="outline"
             onClick={() => setGamepadOn((v) => !v)}
@@ -342,8 +383,101 @@ export default function TrainerApp() {
           >
             <Maximize className="h-4 w-4" />
           </Button>
+          <Button
+            variant={menuOpen ? "default" : "outline"}
+            onClick={() => setMenuOpen((v) => !v)}
+            aria-expanded={menuOpen}
+            aria-label="Menü öffnen"
+            className={`h-9 px-2 ${menuOpen ? "bg-cyan-500 text-black hover:bg-cyan-400" : "border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/10"}`}
+          >
+            <Menu className="h-4 w-4" />
+          </Button>
         </div>
       </header>
+
+      {/* ── v2.2: Vollbild-Menü (große Touch-Ziele statt 8 Topbar-Buttons) ── */}
+      {menuOpen && (
+        <div
+          className="absolute inset-0 z-50 bg-[#05060a]/70 backdrop-blur-sm"
+          onClick={() => setMenuOpen(false)}
+          role="presentation"
+        >
+          <nav
+            className="absolute inset-x-2 top-12 max-h-[calc(100%-4rem)] overflow-y-auto rounded-2xl border border-cyan-500/25 bg-[#0b0f18] p-2 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+            aria-label="Hauptmenü"
+            style={{ paddingBottom: "calc(0.5rem + env(safe-area-inset-bottom))" }}
+          >
+            <div className="px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+              Panels
+            </div>
+            {MENU_ITEMS.map((item) => {
+              const Icon = item.icon;
+              const active = panel === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => openPanel(item.id)}
+                  className={`flex min-h-[56px] w-full items-center gap-3 rounded-xl px-3 text-left transition-colors ${
+                    active
+                      ? (item.ki ? "bg-fuchsia-500/20 text-fuchsia-200" : "bg-cyan-500/20 text-cyan-100")
+                      : "text-slate-200 hover:bg-white/5"
+                  }`}
+                >
+                  <span
+                    className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border ${
+                      item.ki
+                        ? "border-fuchsia-500/40 bg-fuchsia-500/10 text-fuchsia-300"
+                        : "border-cyan-500/30 bg-cyan-500/10 text-cyan-300"
+                    }`}
+                  >
+                    <Icon className="h-5 w-5" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium">{item.label}</span>
+                    <span className="block truncate text-[11px] text-slate-500">{item.desc}</span>
+                  </span>
+                  {active && (
+                    <span className={`shrink-0 rounded-full px-2 py-0.5 text-[9px] font-semibold uppercase ${
+                      item.ki ? "bg-fuchsia-500/30 text-fuchsia-200" : "bg-cyan-500/30 text-cyan-200"
+                    }`}>
+                      offen
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+            <div className="mt-2 flex gap-2 border-t border-cyan-500/15 pt-2">
+              <Button
+                variant="outline"
+                onClick={() => { core()?.resetSim(); setMenuOpen(false); }}
+                disabled={tel.mode === "test" || tel.loading}
+                className="h-11 flex-1 gap-1.5 border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/10"
+              >
+                <RotateCcw className="h-4 w-4" /> Reset
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => { importRef.current?.click(); setMenuOpen(false); }}
+                className="h-11 flex-1 gap-1.5 border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/10"
+              >
+                <Upload className="h-4 w-4" /> Import
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => { void onExport(); setMenuOpen(false); }}
+                className="h-11 flex-1 gap-1.5 border-cyan-500/30 text-cyan-300 hover:bg-cyan-500/10"
+              >
+                <Download className="h-4 w-4" /> Export
+              </Button>
+            </div>
+            <p className="px-3 pt-2 text-[10px] leading-snug text-slate-600">
+              Tippe außerhalb des Menüs, um es zu schließen.
+            </p>
+          </nav>
+        </div>
+      )}
 
       {/* ── HUD (Modus + Quelle + Telemetrie) ── */}
       <div className="pointer-events-none absolute left-2 top-14 z-20 flex max-w-[calc(100%-1rem)] flex-wrap gap-1.5 sm:left-3 sm:top-16">
@@ -442,6 +576,15 @@ export default function TrainerApp() {
         </Button>
       </div>
 
+      {/* v2.2: versteckter Import-Dialog (Android: öffnet den Dateimanager) */}
+      <input
+        ref={importRef}
+        type="file"
+        accept=".json,application/json"
+        className="hidden"
+        onChange={(e) => { void onImportFile(e.target.files?.[0] ?? null); e.target.value = ""; }}
+      />
+
       {/* ES-Policy-Hinweis (Quelle ES ohne Modell) */}
       {tel.source === "es" && !tel.esReady && (
         <div className="absolute left-1/2 top-1/2 z-20 -translate-x-1/2 -translate-y-1/2 rounded-lg border border-amber-400/40 bg-[#0b0f18]/95 px-4 py-3 text-center text-xs text-amber-300 backdrop-blur">
@@ -497,6 +640,9 @@ export default function TrainerApp() {
                 onShowBest={() => core()?.showBest()}
                 onSave={() => void onSaveTheta()}
                 onLoad={() => void onLoadTheta()}
+                onTrainCfg={onTrainCfg}
+                onExport={() => void onExport()}
+                onImport={() => importRef.current?.click()}
               />
             )}
             {panel === "reward" && <RewardPanel tel={tel} onChange={onReward} />}

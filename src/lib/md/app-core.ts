@@ -14,6 +14,7 @@ import { EsTrainer, stepRewardValue, type EsStats, type TurboLevel, type ImitEva
 import type { MappingEntry, SourceId } from "./mapping";
 import { poseById, loadMapping, saveMapping } from "./mapping";
 import { loadRewardConfig, saveRewardConfig, type RewardConfig } from "./rewards";
+import { clearCustomFnCache } from "./customcode";
 import {
   defaultWorldConfig, generateWorld, arenaHalf, randomSeed,
   buildWorldMeshes, type WorldConfig, type WorldBuild,
@@ -52,6 +53,22 @@ export function defaultPointCfg(modelId: ModelId | null): PointCfg {
   };
 }
 
+// ── v2.2: Trainings-Konfiguration („Runden“ + Hyperparameter) ──
+export interface TrainCfg {
+  /** Rollout-Länge in Policy-Steps (Rundenlänge). */
+  rolloutSteps: number;
+  /** Ziel-Generationen; 0 = unbegrenzt (läuft bis Stop). */
+  maxGenerations: number;
+  /** ES-Lernrate. */
+  lr: number;
+  /** Start-/Basis-Sigma (Rauschen). */
+  sigma: number;
+}
+
+export function defaultTrainCfg(): TrainCfg {
+  return { rolloutSteps: 200, maxGenerations: 0, lr: 0.03, sigma: 0.08 };
+}
+
 export interface Telemetry {
   booted: boolean;
   loading: boolean;
@@ -75,6 +92,8 @@ export interface Telemetry {
   mappings: MappingEntry[];
   reward: RewardConfig;
   // ── v2.1/2.2 ──
+  trainCfg: TrainCfg;
+  customCode: { name: string; enabled: boolean } | null;
   world: WorldConfig;
   pointMode: boolean; // abgeleitet: mode !== "aus"
   pointCfg: PointCfg;
@@ -92,6 +111,8 @@ const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v
 export class TrainerCore {
   // ── Callbacks (React-Seite) ──
   onTelemetry: (t: Telemetry) => void = () => {};
+  /** v2.2: Hinweise (Auto-Stop, Import-Ergebnis …) als Toast. */
+  onNotice: (title: string, message: string) => void = () => {};
 
   // ── Laufzeit-Zustand ──
   private world: World | null = null;
@@ -109,6 +130,7 @@ export class TrainerCore {
   private overridePolicy: string | null = null; // Gamepad-Button hat umgeschaltet
   private mappings: MappingEntry[] = [];
   private rewardCfg: RewardConfig | null = null;
+  private trainCfg: TrainCfg = defaultTrainCfg();
   private autoRecovery = true; // Test-Modus: sanftes Aufrichten nach Sturz
 
   // Gamepad-Eingaben
@@ -148,6 +170,7 @@ export class TrainerCore {
   private testStart = 0;
   private testUptime = 0;
   private testReward = 0;
+  private testStepN = 0;
   private prevAct: Float32Array = new Float32Array(0);
   private actBuf: Float32Array = new Float32Array(0);
 
@@ -226,11 +249,13 @@ export class TrainerCore {
       this.engine.targetPoint = this.pointCfg.mode !== "aus" ? [...this.point] as [number, number] : null;
       this.prevAct = new Float32Array(meta.actionDim);
       this.actBuf = new Float32Array(meta.actionDim);
-      // Mappings + Bewertung pro Modell laden (Persistenz)
+      // Mappings + Bewertung + TrainCfg pro Modell laden (Persistenz)
       this.mappings = loadMapping(id);
       this.rewardCfg = loadRewardConfig(id);
+      this.trainCfg = loadTrainPrefs(id);
       this.testUptime = 0;
       this.testReward = 0;
+      this.testStepN = 0;
       this.error = null;
     } catch (err: any) {
       this.error = err?.message || String(err);
@@ -269,6 +294,7 @@ export class TrainerCore {
       this.testStart = performance.now();
       this.testUptime = 0;
       this.testReward = 0;
+      this.testStepN = 0;
       this.prevAct.fill(0);
     }
     this.emit();
@@ -298,6 +324,47 @@ export class TrainerCore {
     this.trainer?.setReward(cfg);
     if (persist && this.modelId) saveRewardConfig(this.modelId, cfg);
     this.emit();
+  }
+
+  /** v2.2: KI-Code-Term setzen (null = entfernen). */
+  setCustomTerm(term: RewardConfig["custom"] | null): void {
+    if (!this.rewardCfg) return;
+    const next: RewardConfig = { ...this.rewardCfg };
+    if (term && term.code && typeof term.weight === "number") {
+      next.custom = {
+        enabled: term.enabled !== false,
+        weight: Math.min(20, Math.max(-20, term.weight)),
+        name: (term.name || "KI-Code").slice(0, 40),
+        code: term.code,
+      };
+    } else {
+      delete next.custom;
+      clearCustomFnCache();
+    }
+    this.setReward(next);
+  }
+
+  /** v2.2: Rundenlänge / Ziel-Generationen / lr / sigma. */
+  setTrainCfg(patch: Partial<TrainCfg>): void {
+    const next: TrainCfg = { ...this.trainCfg };
+    if (Number.isFinite(patch.rolloutSteps)) next.rolloutSteps = clamp(Math.round(patch.rolloutSteps!), 30, 1000);
+    if (Number.isFinite(patch.maxGenerations)) next.maxGenerations = clamp(Math.round(patch.maxGenerations!), 0, 100000);
+    if (Number.isFinite(patch.lr)) next.lr = clamp(patch.lr!, 0.002, 0.2);
+    if (Number.isFinite(patch.sigma)) next.sigma = clamp(patch.sigma!, 0.005, 0.3);
+    this.trainCfg = next;
+    if (this.modelId) saveTrainPrefs(this.modelId, next);
+    this.applyTrainCfg();
+    this.emit();
+  }
+
+  private applyTrainCfg(): void {
+    const t = this.trainer;
+    if (!t) return;
+    t.rolloutSteps = this.trainCfg.rolloutSteps;
+    t.lr = this.trainCfg.lr;
+    t.sigma = this.trainCfg.sigma;
+    t.baseSigma = this.trainCfg.sigma;
+    t.maxGenerations = this.trainCfg.maxGenerations;
   }
 
   setJoystick(x: number, y: number) {
@@ -561,6 +628,7 @@ export class TrainerCore {
       }
       this.trainer.setReward(this.rewardCfg!);
       this.trainer.setTargetPoint(this.pointCfg.mode !== "aus" ? ([...this.point] as [number, number]) : null);
+      this.applyTrainCfg();
       this.trainingActive = true;
       this.emit();
       await this.trainer.tryStartWorkers();
@@ -588,6 +656,17 @@ export class TrainerCore {
       await this.trainer.runGeneration();
       this.updateEsView();
       this.emit();
+      // v2.2: Ziel-Generationen erreicht → automatisch stoppen
+      const maxGen = this.trainer.maxGenerations;
+      if (maxGen > 0 && this.trainer.generation >= maxGen) {
+        this.trainingActive = false;
+        this.onNotice(
+          "Ziel erreicht",
+          `${maxGen} Generationen fertig (Best: ${Number.isFinite(this.trainer.bestEver) ? this.trainer.bestEver.toFixed(2) : "–"}). Training gestoppt.`,
+        );
+        this.emit();
+        break;
+      }
       await new Promise((r) => setTimeout(r, 30));
     }
   }
@@ -653,21 +732,96 @@ export class TrainerCore {
         layout: MlpLayout; theta: number[]; bestTheta: number[];
         generation: number; bestEver: number; history: number[];
       };
+      return await this.restoreTheta(d);
+    } catch (err) {
+      console.warn("[core] Theta-Load fehlgeschlagen:", err);
+      return false;
+    }
+  }
+
+  /** v2.2: Theta-Daten in einen neuen Trainer übernehmen (Load + Import). */
+  private async restoreTheta(d: {
+    layout: MlpLayout; theta: number[]; bestTheta?: number[];
+    generation?: number; bestEver?: number; history?: number[];
+  }): Promise<boolean> {
+    try {
       if (!d?.theta?.length || !d?.layout) return false;
       this.trainingActive = false;
       this.trainer?.dispose();
-      this.trainer = new EsTrainer(this.modelId, new Float32Array(d.theta), d.layout, this.rewardCfg!);
+      this.trainer = new EsTrainer(this.modelId!, new Float32Array(d.theta), d.layout, this.rewardCfg!);
       await this.trainer.init();
       this.trainer.bestTheta = new Float32Array(d.bestTheta ?? d.theta);
       this.trainer.generation = d.generation ?? 0;
       this.trainer.bestEver = d.bestEver ?? -Infinity;
       this.trainer.history = Array.isArray(d.history) ? d.history : [];
+      this.applyTrainCfg();
       this.updateEsView();
       this.emit();
       return true;
     } catch (err) {
-      console.warn("[core] Theta-Load fehlgeschlagen:", err);
+      console.warn("[core] Theta-Restore fehlgeschlagen:", err);
       return false;
+    }
+  }
+
+  /** v2.2: Alles (Policy + Regeln + TrainCfg + Mapping) als JSON-String exportieren. */
+  exportAll(): string | null {
+    if (!this.modelId) return null;
+    const t = this.trainer;
+    return JSON.stringify({
+      app: "microduck-trainer",
+      exportVersion: 2,
+      exportedAt: new Date().toISOString(),
+      modelId: this.modelId,
+      theta: t ? Array.from(t.theta) : null,
+      bestTheta: t ? Array.from(t.bestTheta) : null,
+      layout: t ? t.layout : null,
+      generation: t ? t.generation : 0,
+      bestEver: t ? t.bestEver : null,
+      history: t ? t.history.slice(-200) : [],
+      reward: this.rewardCfg,
+      trainCfg: this.trainCfg,
+      pointCfg: this.pointCfg,
+      worldCfg: this.worldCfg,
+      mappings: this.mappings,
+    });
+  }
+
+  /** v2.2: Export-JSON wiederherstellen (gleiches Modell oder Modellwechsel). */
+  async importAll(json: string): Promise<{ ok: boolean; message: string }> {
+    try {
+      const d = JSON.parse(json) as any;
+      if (d?.app !== "microduck-trainer" || !d.modelId) {
+        return { ok: false, message: "Keine MicroDuck-Trainer-Exportdatei." };
+      }
+      if (d.modelId !== this.modelId) {
+        if (d.modelId !== "microduck" && d.modelId !== "unitree_g1") {
+          return { ok: false, message: `Unbekanntes Modell: ${d.modelId}` };
+        }
+        await this.loadModel(d.modelId);
+      }
+      const parts: string[] = [];
+      if (d.reward?.terms) { this.setReward(d.reward); parts.push("Bewertung"); }
+      if (d.trainCfg) { this.setTrainCfg(d.trainCfg); parts.push("Runden-Einstellungen"); }
+      if (Array.isArray(d.mappings)) { this.setMappings(d.mappings); parts.push("Mapping"); }
+      if (d.pointCfg?.mode) { this.setPointCfg(d.pointCfg); parts.push("Punkt-Modus"); }
+      if (d.worldCfg && typeof d.worldCfg.seed === "number") {
+        await this.setWorld(d.worldCfg);
+        parts.push("Welt");
+      }
+      let policyOk = false;
+      if (d.theta?.length && d.layout) {
+        policyOk = await this.restoreTheta(d);
+        if (policyOk) parts.push(`Policy (Gen ${d.generation ?? 0})`);
+      }
+      if (parts.length === 0) {
+        return { ok: false, message: "Datei enthält keine verwertbaren Daten." };
+      }
+      const msg = `Übernommen: ${parts.join(", ")}`;
+      this.onNotice("Import abgeschlossen", msg);
+      return { ok: true, message: msg };
+    } catch (err: any) {
+      return { ok: false, message: err?.message || String(err) };
     }
   }
 
@@ -912,7 +1066,11 @@ export class TrainerCore {
     engine.stepWithAction(this.actBuf);
 
     if (this.mode === "test") {
-      this.testReward += stepRewardValue(engine, this.rewardCfg!, this.actBuf, this.prevAct);
+      this.testStepN++;
+      this.testReward += stepRewardValue(
+        engine, this.rewardCfg!, this.actBuf, this.prevAct,
+        { t: this.testUptime, step: this.testStepN, dt: this.stepMs() / 1000 },
+      );
       this.prevAct.set(this.actBuf);
     }
   }
@@ -999,7 +1157,11 @@ export class TrainerCore {
     engine.lastAction.set(act);
     engine.stepWithAction(act);
     if (this.mode === "test") {
-      this.testReward += stepRewardValue(engine, this.rewardCfg!, act, this.prevAct);
+      this.testStepN++;
+      this.testReward += stepRewardValue(
+        engine, this.rewardCfg!, act, this.prevAct,
+        { t: this.testUptime, step: this.testStepN, dt: this.stepMs() / 1000 },
+      );
       this.prevAct.set(act);
     }
   }
@@ -1100,6 +1262,10 @@ export class TrainerCore {
       es: this.trainer ? this.trainer.stats() : null,
       mappings: this.mappings,
       reward: this.rewardCfg ?? (this.modelId ? loadRewardConfig(this.modelId) : ({} as RewardConfig)),
+      trainCfg: { ...this.trainCfg },
+      customCode: this.rewardCfg?.custom
+        ? { name: this.rewardCfg.custom.name, enabled: this.rewardCfg.custom.enabled }
+        : null,
       world: this.worldCfg,
       pointMode: this.pointCfg.mode !== "aus",
       pointCfg: { ...this.pointCfg },
@@ -1207,6 +1373,29 @@ function loadPointPrefs(modelId: ModelId): PointCfg {
 
 function savePointPrefs(modelId: ModelId, cfg: PointCfg): void {
   try { localStorage.setItem(`mdt_v2_pointcfg_${modelId}`, JSON.stringify(cfg)); } catch { /* ignore */ }
+}
+
+function loadTrainPrefs(modelId: ModelId): TrainCfg {
+  const def = defaultTrainCfg();
+  try {
+    const raw = localStorage.getItem(`mdt_v2_traincfg_${modelId}`);
+    if (raw) {
+      const p = JSON.parse(raw) as Partial<TrainCfg>;
+      if (p && typeof p === "object") {
+        return {
+          rolloutSteps: Number.isFinite(p.rolloutSteps) ? clamp(Math.round(p.rolloutSteps!), 30, 1000) : def.rolloutSteps,
+          maxGenerations: Number.isFinite(p.maxGenerations) ? clamp(Math.round(p.maxGenerations!), 0, 100000) : def.maxGenerations,
+          lr: Number.isFinite(p.lr) ? clamp(p.lr!, 0.002, 0.2) : def.lr,
+          sigma: Number.isFinite(p.sigma) ? clamp(p.sigma!, 0.005, 0.3) : def.sigma,
+        };
+      }
+    }
+  } catch { /* ignore */ }
+  return def;
+}
+
+function saveTrainPrefs(modelId: ModelId, cfg: TrainCfg): void {
+  try { localStorage.setItem(`mdt_v2_traincfg_${modelId}`, JSON.stringify(cfg)); } catch { /* ignore */ }
 }
 
 export default TrainerCore;

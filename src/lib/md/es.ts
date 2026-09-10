@@ -10,6 +10,7 @@ import { Engine } from "./engine";
 import { MlpPolicy, type MlpLayout } from "./policy";
 import type { RewardConfig } from "./rewards";
 import type { WorldBuild } from "./worldgen";
+import { getCustomFn, evalCustomFn, type CustomRewardFn } from "./customcode";
 
 /** Imitations-Daten für Rollouts (Main-Thread + Worker, identisch). */
 export interface ImitEvalData {
@@ -95,12 +96,16 @@ function resetCtx(engine: Engine, ctx: RolloutCtx) {
   ctx.prevAct.fill(0);
 }
 
+/** Zusatz-Info für den Custom-Code-Term (Zeit/Schritt). */
+export interface StepCtxInfo { t: number; step: number; dt: number }
+
 /**
  * Reward-Terme für EINEN Policy-Step (Zustand NACH dem Physik-Step).
  * Geteilt zwischen Rollouts (ES) und Test-Modus (kumulierter Reward).
  */
 export function stepRewardValue(
   engine: Engine, cfg: RewardConfig, act: Float32Array, prevAct: Float32Array,
+  ctxInfo?: StepCtxInfo,
 ): number {
   const T = cfg.terms;
   const gz = engine.projGravZ();
@@ -187,6 +192,33 @@ export function stepRewardValue(
       val += T.pointAvoid.weight * Math.min(1, d / Math.max(0.05, T.pointAvoid.param));
     }
   }
+  // ── v2.2: KI-Code-Term (Gemini-geschriebener Funktionskörper) ──
+  const C = cfg.custom;
+  if (C?.enabled && C.code) {
+    const fn: CustomRewardFn | null = getCustomFn(C.code);
+    if (fn) {
+      const qvel2 = engine.data.qvel as Float32Array;
+      const meta2 = engine.meta;
+      val += C.weight * evalCustomFn(fn, {
+        h: h, height: h,
+        upZ, gz,
+        vx, vy, vz: qvel2[2] ?? 0, omega,
+        angles: engine.jointAngles(),
+        act, prevAct,
+        qpos: engine.data.qpos as Float32Array,
+        qvel: qvel2,
+        qacc: engine.data.qacc as Float32Array,
+        torso: engine.torsoPos(),
+        target: engine.targetPoint ? [engine.targetPoint[0], engine.targetPoint[1]] : null,
+        cmd: engine.cmd,
+        imitDelta: engine.imitRootDelta,
+        imitTarget: engine.imitTarget,
+        dt: ctxInfo?.dt ?? (meta2 ? meta2.timestep * meta2.decimation : 0.02),
+        t: ctxInfo?.t ?? 0,
+        step: ctxInfo?.step ?? 0,
+      });
+    }
+  }
   return val;
 }
 
@@ -211,7 +243,9 @@ function ctxStep(
   ctx.n++;
   ctx.t += policyDt;
 
-  ctx.sum += stepRewardValue(engine, cfg, ctx.act, ctx.prevAct);
+  ctx.sum += stepRewardValue(
+    engine, cfg, ctx.act, ctx.prevAct, { t: ctx.t, step: ctx.n, dt: policyDt },
+  );
   ctx.prevAct.set(ctx.act);
 
   if (engine.isFallen()) {
@@ -240,6 +274,8 @@ export class EsTrainer {
   baseSigma = BASE_SIGMA;
   lr = LR;
   rolloutSteps = 200;
+  /** v2.2: Training stoppt automatisch nach N Generationen (0 = unbegrenzt). */
+  maxGenerations = 0;
   turbo: TurboLevel = 1;
   reward: RewardConfig;
 

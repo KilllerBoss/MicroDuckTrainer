@@ -10,9 +10,18 @@ export interface TermState {
   param: number; // bedeutung je Term (z. B. Zielhöhe, Ziel-Tempo)
 }
 
+/** v2.2: KI-geschriebener Reward-Code (Gemini-Code-Experte / Handedit). */
+export interface CustomRewardTerm {
+  enabled: boolean;
+  weight: number;
+  name: string;
+  code: string;
+}
+
 export interface RewardConfig {
   version: 2;
   terms: Record<string, TermState>;
+  custom?: CustomRewardTerm;
 }
 
 export interface RewardTermDef {
@@ -206,6 +215,10 @@ export function loadRewardConfig(modelId: ModelId): RewardConfig {
         const base = defaultRewardConfig(modelId);
         for (const id of TERM_IDS) {
           if (!parsed.terms[id]) parsed.terms[id] = base.terms[id];
+        }
+        // v2.2: Custom-Code-Term erhalten (Typ grob validieren)
+        if (parsed.custom && (typeof parsed.custom.code !== "string" || typeof parsed.custom.weight !== "number")) {
+          delete parsed.custom;
         }
         return parsed;
       }

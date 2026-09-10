@@ -1,8 +1,19 @@
-# 🦆 MicroDuck Trainer v2.1
+# 🦆 MicroDuck Trainer v2.2
 
 MuJoCo-Roboter-Training direkt auf dem Android-Handy – **komplett offline**. Enthält die **Original-MicroDuck-Ente** aus dem HF-Space `pollen-robotics/microduck-simulator` (MJCF, GLB, 9 ONNX-Policies) und den **Unitree G1** aus `google-deepmind/mujoco_menagerie`.
 
-## Features (v2.1 – NEU)
+## Features (v2.2 – NEU)
+
+| Feature | Beschreibung |
+|---|---|
+| 📂 **GLB-Upload gefixt** | Datei-Manager des Handys öffnet sich jetzt beim „GLB hochladen"-Button (WebView-`onShowFileChooser`) – war in v2.1 ohne Funktion |
+| ☰ **Aufgeräumte Oberfläche** | Kompakte Topbar (passt auf jedes Handy) + **Vollbild-Menü** mit großen Touch-Kacheln für alle Panels statt 8 gequetschter Buttons |
+| 👨‍💻 **Gemini Code-Experte** | Gemini **schreibt selbst echten JavaScript-Trainingscode** (Reward-Term) und entscheidet **Rundenlänge, Ziel-Generationen, Turbo, Reset** – den ganzen Trainingscode. Code-Vorschau, Gewichts-Slider, Anwenden, Kopieren, Download |
+| ⏱ **Runden & Hyperparameter** | Rundenlänge (Policy-Schritte je Generation), **Ziel-Generationen mit Auto-Stopp**, Lernrate, Sigma – eigene Regler, per Modell gespeichert; Gemini darf sie mitentscheiden |
+| 💾 **Export/Import** | Vollständiger Trainingsstand (Policy + Regeln + Runden-Einstellungen + Welt + Mapping) als `.json` in den **Downloads-Ordner** exportieren und über den Datei-Manager wieder importieren (APK-Bridge via MediaStore) |
+| ✅ **Code-Sandbox** | KI-Code wird validiert (kein Netz/DOM/eval), kompiliert lokal, läuft in Main-Thread **und** Physik-Workern mit identischer Semantik; Laufzeitfehler bringen das Training nicht zu Fall |
+
+## Features (v2.1)
 
 | Feature | Beschreibung |
 |---|---|
@@ -30,11 +41,11 @@ MuJoCo-Roboter-Training direkt auf dem Android-Handy – **komplett offline**. E
 
 ## Installation
 
-1. `MicroDuckTrainer-v2.1.apk` aus den [Releases](https://github.com/KilllerBoss/MicroDuckTrainer/releases/latest) herunterladen
+1. `MicroDuckTrainer-v2.2.apk` aus den [Releases](https://github.com/KilllerBoss/MicroDuckTrainer/releases/latest) herunterladen
 2. Installieren („Unbekannte Quellen" erlauben)
 3. App startet offline mit Tron-Arena + Ente
 
-> **Update v2.0 → v2.1:** Gleiche Signatur – kann direkt **über** v2.0 installiert werden.
+> **Update v2.1 → v2.2:** Gleiche Signatur – kann direkt **über** v2.1/v2.0 installiert werden.
 > **Hinweis v1.0 → v2.x:** v1.0 hatte eine andere Signatur – v1.0 vorher deinstallieren.
 
 ### Gemini einrichten (optional)

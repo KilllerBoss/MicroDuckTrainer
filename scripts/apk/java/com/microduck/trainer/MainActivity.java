@@ -2,16 +2,23 @@ package com.microduck.trainer;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.ContentValues;
+import android.content.Intent;
 import android.content.res.AssetManager;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.provider.MediaStore;
+import android.util.Base64;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
 import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
+import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -19,15 +26,19 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
+import android.widget.Toast;
 
 import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.HashMap;
 import java.util.Map;
 
 /**
- * MicroDuck Trainer v2.0 – WebView-Shell.
+ * MicroDuck Trainer v2.2 – WebView-Shell.
  *
  * Die App ist ein Next.js-Static-Export (out/), komplett ins APK eingebettet.
  * Über shouldInterceptRequest wird ein virtueller HTTPS-Origin
@@ -39,11 +50,14 @@ public class MainActivity extends Activity {
     private static final String HOST = "appassets.local";
     // aapt2 -A legt den Inhalt des Asset-Ordners direkt unter assets/ ab (ohne Präfix).
     private static final String ASSET_ROOT = "";
+    private static final int FILE_CHOOSER_REQUEST = 4711;
 
     private WebView webView;
     private FrameLayout rootLayout;
     private View customView;
     private WebChromeClient.CustomViewCallback customViewCallback;
+    // v2.2: <input type="file"> → Android-Dateimanager
+    private ValueCallback<Uri[]> filePathCallback;
 
     private static final Map<String, String> MIME = new HashMap<>();
 
@@ -101,7 +115,8 @@ public class MainActivity extends Activity {
         s.setSupportZoom(false);
         s.setBuiltInZoomControls(false);
         s.setAllowFileAccess(false);
-        s.setAllowContentAccess(false);
+        // v2.2: content://-URIs aus dem SAF-Dateimanager erlauben (GLB-Upload)
+        s.setAllowContentAccess(true);
         s.setLoadWithOverviewMode(true);
         s.setUseWideViewPort(true);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -161,7 +176,38 @@ public class MainActivity extends Activity {
             }
         });
 
+        // v2.2: Download-Bridge (JS → Downloads-Ordner), bevor die Seite lädt
+        webView.addJavascriptInterface(new MdtBridge(), "MdtBridge");
+
         webView.setWebChromeClient(new WebChromeClient() {
+            // v2.2: <input type="file"> öffnet den Android-Dateimanager (SAF).
+            // Ohne diesen Callback passiert beim Klick auf „GLB hochladen“ NICHTS –
+            // genau das war der Bug in v2.0/v2.1.
+            @Override
+            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                             FileChooserParams params) {
+                if (filePathCallback != null) {
+                    filePathCallback.onReceiveValue(null);
+                }
+                filePathCallback = callback;
+                try {
+                    Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    // Wichtig: "*/*" statt MIME-Filter – viele Dateimanager taggen
+                    // GLB als application/octet-stream, ein enger Filter würde
+                    // leer anzeigen. Validierung macht die Web-App selbst.
+                    intent.setType("*/*");
+                    Intent chooser = Intent.createChooser(intent, "Datei wählen (z. B. .glb)");
+                    startActivityForResult(chooser, FILE_CHOOSER_REQUEST);
+                    return true;
+                } catch (Exception e) {
+                    filePathCallback = null;
+                    Toast.makeText(MainActivity.this,
+                            "Kein Dateimanager gefunden", Toast.LENGTH_SHORT).show();
+                    return false;
+                }
+            }
+
             // HTML5-Fullscreen (requestFullscreen aus der Web-App) – Pflicht,
             // damit der Vollbild-Button im Trainer wirklich vollflaechig wird.
             @Override
@@ -202,6 +248,108 @@ public class MainActivity extends Activity {
 
         setContentView(rootLayout);
         webView.loadUrl("https://" + HOST + "/index.html");
+    }
+
+    // v2.2: Ergebnis des Dateimanager-Dialogs zurück an die WebView geben
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == FILE_CHOOSER_REQUEST) {
+            if (filePathCallback == null) return;
+            Uri[] results = null;
+            if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+                results = new Uri[]{ data.getData() };
+            }
+            filePathCallback.onReceiveValue(results);
+            filePathCallback = null;
+            return;
+        }
+        super.onActivityResult(requestCode, resultCode, data);
+    }
+
+    /**
+     * v2.2: JS-Brücke für Datei-Downloads. window.MdtBridge.saveFile(name, base64,
+     * mime) schreibt die Datei in den Downloads-Ordner (MediaStore ab Android 10,
+     * app-spezifischer Downloads-Ordner davor) und meldet das Ergebnis als
+     * 'mdt-file-saved'-DOM-Event zurück in die WebView.
+     */
+    private class MdtBridge {
+        @JavascriptInterface
+        public void saveFile(final String name, final String base64, final String mime) {
+            if (name == null || base64 == null) return;
+            // Path-Traversal & ungueltige Zeichen entfernen
+            String safe = name.replaceAll("[\\\\/:*?\"<>|]", "_").trim();
+            if (safe.isEmpty()) safe = "download.bin";
+            final String fname = safe;
+            final byte[] bytes;
+            try {
+                bytes = Base64.decode(base64, Base64.DEFAULT);
+            } catch (IllegalArgumentException e) {
+                notifySaved(fname, false, "Ungültige Daten");
+                return;
+            }
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        String where = writeDownload(fname, bytes,
+                                mime == null ? "application/octet-stream" : mime);
+                        notifySaved(fname, where != null,
+                                where != null ? where : "Speichern fehlgeschlagen");
+                    } catch (Exception e) {
+                        notifySaved(fname, false, String.valueOf(e.getMessage()));
+                    }
+                }
+            }).start();
+        }
+    }
+
+    private String writeDownload(String name, byte[] bytes, String mime) throws IOException {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContentValues cv = new ContentValues();
+            cv.put(MediaStore.Downloads.DISPLAY_NAME, name);
+            cv.put(MediaStore.Downloads.MIME_TYPE, mime);
+            cv.put(MediaStore.Downloads.IS_PENDING, 1);
+            Uri uri = getContentResolver().insert(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+            if (uri == null) return null;
+            OutputStream os = getContentResolver().openOutputStream(uri);
+            if (os == null) return null;
+            os.write(bytes);
+            os.flush();
+            os.close();
+            cv.clear();
+            cv.put(MediaStore.Downloads.IS_PENDING, 0);
+            getContentResolver().update(uri, cv, null, null);
+            return "Downloads/" + name;
+        }
+        // Android 8/9: app-spezifischer Ordner (ohne Berechtigung nutzbar)
+        File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+        if (dir == null) dir = getFilesDir();
+        File out = new File(dir, name);
+        FileOutputStream fos = new FileOutputStream(out);
+        fos.write(bytes);
+        fos.flush();
+        fos.close();
+        return out.getAbsolutePath();
+    }
+
+    private void notifySaved(final String name, final boolean ok, final String info) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                Toast.makeText(MainActivity.this,
+                        ok ? ("Gespeichert: " + info) : ("Fehler: " + info),
+                        Toast.LENGTH_LONG).show();
+                if (webView != null) {
+                    String payload = "{\"ok\":" + ok + ",\"name\":\""
+                            + name.replace("\\\"", "") + "\",\"info\":\""
+                            + info.replace("\\\"", "").replace("\\\\", "/") + "\"}";
+                    webView.evaluateJavascript(
+                            "window.dispatchEvent(new MessageEvent('mdt-file-saved',"
+                                    + "{data:" + payload + "}))", null);
+                }
+            }
+        });
     }
 
     @Override
