@@ -57,3 +57,23 @@ Stage Summary:
 - Bekannt: Sturzrate oszilliert während Exploration (Anker-Restart hält System
   in gesundem Bereich); Curriculum startet bei 50 % und passt Tempo selbst an.
 - Build v2.3 (versionCode 5) folgt; Release v2.3.0 auf GitHub.
+
+---
+Task ID: 7a (v2.3 Release)
+Agent: main (Super Z)
+Task: APK v2.3 bauen + GitHub Release
+
+Work Log:
+- Android-SDK nach Workspace-Reset neu beschafft (build-tools r34 inkl.
+  libc++.so-Extraktion aus dem Zip für zipalign, platform-34-ext7_r03, R8 8.5.35,
+  Temurin JDK 21); platform-URL im Skript dauerhaft gefixt.
+- Manifest: versionCode 5, versionName 2.3 (aapt2-Flags überschreiben manifest-
+  Attribute NICHT → Manifest selbst geändert — Stolperstein dokumentiert).
+- APK 39,7 MB signiert (v1+v2, gleiche Signatur wie v2.0–v2.2 → Update ohne
+  Deinstallation); Badging + Signatur verifiziert.
+- Release v2.3.0 erstellt, APK als Asset hochgeladen, Download verifiziert
+  (HTTP 200, 39.689.391 Bytes, PK-Magic).
+
+Stage Summary:
+- Download: https://github.com/KilllerBoss/MicroDuckTrainer/releases/download/v2.3.0/MicroDuckTrainer-v2.3.apk
+- Release-Seite: https://github.com/KilllerBoss/MicroDuckTrainer/releases/tag/v2.3.0
