@@ -1,2 +1,24 @@
-skills/
+# Next.js
 node_modules/
+.next/
+out/
+next-env.d.ts
+
+# Build-Artefakte
+scripts/apk/build-v2/
+scripts/android-sdk/
+*.idsig
+
+# Laufzeit/Logs
+dev.log
+server.log
+.zscripts/
+db/
+*.tsbuildinfo
+
+# QA-Screenshots
+qa_*.png
+
+# Sonstiges
+agent-ctx/
+.DS_Store
