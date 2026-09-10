@@ -18,24 +18,64 @@ export interface ImitEvalData {
   frames: number;
   fps: number;
   duration: number;
-  targets: Float32Array; // frames × dim
+  targets: Float32Array; // frames × dim (RELATIV zur Ruhelage, v2.3)
   rootY: Float32Array; // frames (GLB y-up)
   baseY: number;
+  // v2.3: Cross-Species-Retargeting (Ente lernt Human-Clips)
+  /** Zentrum-Pose (Ente: defaultPose, G1: standPose) – wird zu den relativen
+   *  Clip-Zielen addiert, damit die Zielpose im Stehen exakt die Standpose ist. */
+  center?: Float32Array;
+  /** Wurzel-Höhen-Skalierung (Roboterhöhe / Clip-Wurzelhöhe), default 1. */
+  scaleY?: number;
 }
 
-/** Zielpose + Wurzel-Delta zum Zeitpunkt t (loop). Schreibt in out. */
+/** Zielpose + Wurzel-Delta zum Zeitpunkt t (loop). Schreibt in out (ABSOLUT). */
 export function imitSampleAt(d: ImitEvalData, t: number, out: Float32Array): number {
   const tt = d.duration > 0 ? ((t % d.duration) + d.duration) % d.duration : 0;
   const x = tt * d.fps;
   const f0 = Math.min(d.frames - 1, Math.floor(x));
   const f1 = Math.min(d.frames - 1, f0 + 1);
   const u = x - f0;
+  const c = d.center;
   for (let j = 0; j < d.dim; j++) {
     const a = d.targets[f0 * d.dim + j];
     const b = d.targets[f1 * d.dim + j];
-    out[j] = a + (b - a) * u;
+    out[j] = (a + (b - a) * u) + (c ? c[j] : 0);
   }
-  return (d.rootY[f0] + (d.rootY[f1] - d.rootY[f0]) * u) - d.baseY;
+  const raw = (d.rootY[f0] + (d.rootY[f1] - d.rootY[f0]) * u) - d.baseY;
+  return raw * (d.scaleY ?? 1);
+}
+
+/**
+ * v2.3: Profi-Trainings-Konfiguration (Professional-Tricks, an/aus + Werte).
+ * Identisch an Main-Thread-Rollouts und ES-Worker übergeben.
+ */
+export interface RunCfg {
+  /** Befehle (cmd) pro Rollout zufällig ziehen + Tracking-Reward → Joystick-fähige Policies. */
+  cmdTrain: boolean;
+  cmdFwd: number; // max Vorwärtstempo der Befehle (m/s)
+  cmdLat: number; // max Seitwärtstempo (m/s)
+  cmdAng: number; // max Gierrate (rad/s)
+  /** Curriculum: Befehls-Tempo automatisch an die Sturzrate anpassen. */
+  curriculum: boolean;
+  /** Action-Lowpass: 1 = aus, sonst EMA-Alpha (0.3–0.9). Gegen Zittern. */
+  actionSmooth: number;
+  /** Zufalls-Stöße auf den Basis-Körper (Domain-Randomization). */
+  pushes: boolean;
+  /** Reset mit kleinem Zustands-Rauschen (Reference-State-Init). */
+  noiseReset: boolean;
+  /** Fitness = Summe (Überleben zählt) oder Mittelwert (klassisch). */
+  fitnessMode: "sum" | "mean";
+  /** Gewichtsbremse (theta-Decay gegen saturierte tanh-Ausgänge), 0 = aus. */
+  weightDecay: number;
+}
+
+export function defaultRunCfg(): RunCfg {
+  return {
+    cmdTrain: true, cmdFwd: 0.25, cmdLat: 0.15, cmdAng: 0.8,
+    curriculum: true, actionSmooth: 0.6, pushes: true, noiseReset: true,
+    fitnessMode: "sum", weightDecay: 0.02,
+  };
 }
 
 export type TurboLevel = 1 | 4 | 16 | 32 | 64;
