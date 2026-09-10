@@ -18,24 +18,102 @@ export interface ImitEvalData {
   frames: number;
   fps: number;
   duration: number;
-  targets: Float32Array; // frames × dim
+  targets: Float32Array; // frames × dim – v2.3: RELATIV zur Ruhelage
   rootY: Float32Array; // frames (GLB y-up)
   baseY: number;
+  /** v2.3: Ruhelage des Roboters (Gelenkwinkel) – Ziele absolut = rel + center. */
+  center?: Float32Array | null;
+  /** v2.3: Roboterhöhe / Clip-Wurzelhöhe (Cross-Species-Skalierung). */
+  scaleY?: number;
 }
 
-/** Zielpose + Wurzel-Delta zum Zeitpunkt t (loop). Schreibt in out. */
+/** Zielpose (ABSOLUT) + Wurzel-Delta zum Zeitpunkt t (loop). Schreibt in out. */
 export function imitSampleAt(d: ImitEvalData, t: number, out: Float32Array): number {
   const tt = d.duration > 0 ? ((t % d.duration) + d.duration) % d.duration : 0;
   const x = tt * d.fps;
   const f0 = Math.min(d.frames - 1, Math.floor(x));
   const f1 = Math.min(d.frames - 1, f0 + 1);
   const u = x - f0;
+  const center = d.center;
   for (let j = 0; j < d.dim; j++) {
     const a = d.targets[f0 * d.dim + j];
     const b = d.targets[f1 * d.dim + j];
-    out[j] = a + (b - a) * u;
+    let v = a + (b - a) * u;
+    if (center && j < center.length) v += center[j];
+    // v2.3 NaN-Schutz: kaputte Clip-Werte → Ruhelage
+    out[j] = Number.isFinite(v) ? v : (center ? center[j] : 0);
   }
-  return (d.rootY[f0] + (d.rootY[f1] - d.rootY[f0]) * u) - d.baseY;
+  const raw = (d.rootY[f0] + (d.rootY[f1] - d.rootY[f0]) * u) - d.baseY;
+  const s = d.scaleY ?? 1;
+  return Number.isFinite(raw) ? raw * s : 0;
+}
+
+// ── v2.3: Profi-Tricks (Lauftraining nach Stand der Technik) ───────────────────
+
+/** Konfiguration der Profi-Tricks (TrainingPanel + Gemini). */
+export interface RunCfg {
+  /** Zufällige Geschwindigkeitsbefehle pro Runde (Joystick-Fähigkeit lernen). */
+  cmdTrain: boolean;
+  cmdFwd: number; // max. Vorwärtstempo (m/s)
+  cmdLat: number; // max. Seitwärtstempo (m/s)
+  cmdAng: number; // max. Gierrate (rad/s)
+  /** Curriculum: Tempo bei vielen Stürzen automatisch reduzieren. */
+  curriculum: boolean;
+  /** Aktions-Glättung (EMA): 0.3 = sehr glatt, 1 = aus. Gegen Zittern. */
+  actionSmooth: number;
+  /** Zufalls-Stöße auf den Körper (Domain Randomization → robustes Gehen). */
+  pushes: boolean;
+  /** Reset-Rauschen (jeder Start leicht anders → keine Memory-Löcher). */
+  noiseReset: boolean;
+  /** Fitness = Summe (Überleben zählt) statt Mittelwert. */
+  fitnessMode: "sum" | "mean";
+  /** Weight-Decay gegen Theta-Drift/tanh-Sättigung (0 = aus). */
+  weightDecay: number;
+}
+
+export function defaultRunCfg(): RunCfg {
+  return {
+    cmdTrain: true,
+    cmdFwd: 0.3, cmdLat: 0.15, cmdAng: 0.8,
+    curriculum: true,
+    actionSmooth: 0.6,
+    pushes: true,
+    noiseReset: true,
+    fitnessMode: "sum",
+    weightDecay: 0.005,
+  };
+}
+
+function sanitizeRunCfg(p: unknown): RunCfg {
+  const d = defaultRunCfg();
+  if (!p || typeof p !== "object") return d;
+  const o = p as Partial<RunCfg>;
+  const num = (v: unknown, def: number, lo: number, hi: number) =>
+    typeof v === "number" && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : def;
+  return {
+    cmdTrain: typeof o.cmdTrain === "boolean" ? o.cmdTrain : d.cmdTrain,
+    cmdFwd: num(o.cmdFwd, d.cmdFwd, 0, 1.2),
+    cmdLat: num(o.cmdLat, d.cmdLat, 0, 0.6),
+    cmdAng: num(o.cmdAng, d.cmdAng, 0, 2),
+    curriculum: typeof o.curriculum === "boolean" ? o.curriculum : d.curriculum,
+    actionSmooth: num(o.actionSmooth, d.actionSmooth, 0.2, 1),
+    pushes: typeof o.pushes === "boolean" ? o.pushes : d.pushes,
+    noiseReset: typeof o.noiseReset === "boolean" ? o.noiseReset : d.noiseReset,
+    fitnessMode: o.fitnessMode === "mean" ? "mean" : "sum",
+    weightDecay: num(o.weightDecay, d.weightDecay, 0, 0.05),
+  };
+}
+
+/** Zufalls-Bewegungsbefehl für eine Runde (mit Curriculum-Skalierung). */
+function drawCmd(cfg: RunCfg, cmdScale: number, out: Float32Array): void {
+  if (cfg.cmdTrain) {
+    out[0] = Math.random() * cfg.cmdFwd * cmdScale;
+    if (out.length > 1) out[1] = (Math.random() * 2 - 1) * cfg.cmdLat * cmdScale;
+    if (out.length > 2) out[2] = (Math.random() * 2 - 1) * cfg.cmdAng * cmdScale;
+  } else {
+    out.fill(0);
+    if (out.length > 0) out[0] = 0.25 * cmdScale;
+  }
 }
 
 export type TurboLevel = 1 | 4 | 16 | 32 | 64;
@@ -68,6 +146,9 @@ export interface EsStats {
 const BASE_SIGMA = 0.08;
 const LR = 0.03;
 const STAGNATION_GENS = 8;
+/** v2.3: Curriculum-Schwellen (Sturzrate → Tempo-Skalierung). */
+const CURRICULUM_UP = 0.08; // unter 8 % Stürze → Tempo hoch
+const CURRICULUM_DOWN = 0.45; // über 45 % Stürze → Tempo runter
 
 // ── Rollout-Kontext (kooperativ schrittweise, für Interleaving) ──────────────
 
@@ -82,18 +163,37 @@ interface RolloutCtx {
   done: boolean;
   prevAct: Float32Array;
   act: Float32Array;
+  cmd: Float32Array; // v2.3: Bewegungsbefehl dieser Runde
+  pushTimer: number; // v2.3: Steps bis zum nächsten Zufalls-Stoß
+  poisoned: boolean; // v2.3: Physik divergiert (NaN) → Runde abbrechen
 }
 
-function resetCtx(engine: Engine, ctx: RolloutCtx) {
+function resetCtx(engine: Engine, ctx: RolloutCtx, cfg: RunCfg, cmdScale: number) {
   engine.setData(ctx.data);
   engine.resetToKeyframe();
-  engine.cmd.fill(0);
+  // v2.3: Reset-Rauschen – jeder Start leicht anders (Reference-State-Init)
+  if (cfg.noiseReset) {
+    const qpos = engine.data.qpos as Float32Array;
+    const qvel = engine.data.qvel as Float32Array;
+    for (let j = 0; j < engine.meta.actionDim; j++) {
+      qpos[engine.qposAdrOf(j)] += (Math.random() * 2 - 1) * 0.04;
+    }
+    for (let j = 0; j < Math.min(6, qvel.length); j++) {
+      qvel[j] += (Math.random() * 2 - 1) * 0.08;
+    }
+    engine.mujoco.mj_forward(engine.model, engine.data);
+  }
+  drawCmd(cfg, cmdScale, ctx.cmd);
+  engine.cmd.set(ctx.cmd);
   ctx.n = 0;
   ctx.t = 0;
   ctx.sum = 0;
   ctx.fell = false;
   ctx.done = false;
+  ctx.poisoned = false;
+  ctx.pushTimer = 60 + Math.floor(Math.random() * 60);
   ctx.prevAct.fill(0);
+  ctx.act.fill(0);
 }
 
 /** Zusatz-Info für den Custom-Code-Term (Zeit/Schritt). */
@@ -224,7 +324,7 @@ export function stepRewardValue(
 
 /** Genau EINEN Policy-Step des Rollouts (Rundeneinteilung für Interleaving). */
 function ctxStep(
-  engine: Engine, ctx: RolloutCtx, cfg: RewardConfig,
+  engine: Engine, ctx: RolloutCtx, cfg: RewardConfig, runCfg: RunCfg,
   imit: ImitEvalData | null, imitBuf: Float32Array | null, policyDt: number,
 ): void {
   const T = cfg.terms;
@@ -238,27 +338,68 @@ function ctxStep(
   }
   const obs = engine.obsFor(!!imit);
   ctx.mlp.forward(obs, ctx.act);
+  // v2.3: Aktions-EMA-Glättung – killt Zittern (Profi-Trick aus RL-Laufwerken)
+  const a = runCfg.actionSmooth;
+  if (a < 1) {
+    for (let j = 0; j < ctx.act.length; j++) {
+      ctx.act[j] = a * ctx.act[j] + (1 - a) * ctx.prevAct[j];
+    }
+  }
   engine.lastAction.set(ctx.act);
   engine.stepWithAction(ctx.act);
   ctx.n++;
   ctx.t += policyDt;
 
-  ctx.sum += stepRewardValue(
-    engine, cfg, ctx.act, ctx.prevAct, { t: ctx.t, step: ctx.n, dt: policyDt },
-  );
-  ctx.prevAct.set(ctx.act);
+  // v2.3: Zufalls-Stöße (Domain Randomization) nach kurzer Schonfrist
+  if (runCfg.pushes && ctx.n > 40 && !ctx.poisoned) {
+    if (--ctx.pushTimer <= 0) {
+      ctx.pushTimer = 80 + Math.floor(Math.random() * 120);
+      const qvel = engine.data.qvel as Float32Array;
+      const s = 0.35;
+      if (qvel.length >= 6) {
+        qvel[0] += (Math.random() * 2 - 1) * s;
+        qvel[1] += (Math.random() * 2 - 1) * s;
+        qvel[5] += (Math.random() * 2 - 1) * s * 0.8;
+      }
+    }
+  }
 
+  // v2.3: ERST Sturz/NaN prüfen, DANN Reward (NaN darf sum nie vergiften)
   if (engine.isFallen()) {
     ctx.fell = true;
     ctx.done = true;
-    if (T.fall?.enabled) ctx.sum -= T.fall.weight * ctx.n; // wird unten /n geteilt
-  } else if (ctx.n >= ctx.steps) {
+    if (T.fall?.enabled) ctx.sum -= T.fall.weight; // einmalige Strafe
+    return;
+  }
+  const val = stepRewardValue(
+    engine, cfg, ctx.act, ctx.prevAct, { t: ctx.t, step: ctx.n, dt: policyDt },
+  );
+  if (!Number.isFinite(val)) {
+    // Physik divergiert → Runde als gescheitert werten (kein NaN in sum!)
+    ctx.poisoned = true;
+    ctx.fell = true;
+    ctx.done = true;
+    ctx.sum -= T.fall?.enabled ? T.fall.weight : 5;
+    return;
+  }
+  ctx.sum += val;
+  ctx.prevAct.set(ctx.act);
+
+  if (ctx.n >= ctx.steps) {
     ctx.done = true;
   }
 }
 
-function finishCtx(ctx: RolloutCtx): number {
-  return ctx.n > 0 ? ctx.sum / ctx.n : 0;
+function finishCtx(ctx: RolloutCtx, runCfg: RunCfg): number {
+  if (ctx.n <= 0) return 0;
+  let f: number;
+  if (runCfg.fitnessMode === "sum") {
+    // Sum-Modus, über Rundenlängen vergleichbar: Reward-Dichte + Überlebensbonus
+    f = (ctx.sum / Math.max(1, ctx.steps)) * 100 + (ctx.n / Math.max(1, ctx.steps)) * 20;
+  } else {
+    f = ctx.sum / ctx.n;
+  }
+  return Number.isFinite(f) ? f : -100;
 }
 
 // ── EsTrainer ────────────────────────────────────────────────────────────────
@@ -290,6 +431,9 @@ export class EsTrainer {
   sinceImprovement = 0;
   evaluator: "worker" | "main" = "main";
   workersReady = 0;
+  // v2.3: Profi-Tricks
+  runCfg: RunCfg = defaultRunCfg();
+  cmdScale = 0.4; // Curriculum: startet konservativ, wächst bei wenig Stürzen
   // v2.1: Welt + Imitation für Rollouts
   obsExtra = 0;
   world: WorldBuild | null = null;
@@ -374,6 +518,8 @@ export class EsTrainer {
             dim: this.imit.dim, frames: this.imit.frames, fps: this.imit.fps,
             duration: this.imit.duration, targets: this.imit.targets.buffer,
             rootY: this.imit.rootY.buffer, baseY: this.imit.baseY,
+            center: this.imit.center ? this.imit.center.buffer : null,
+            scaleY: this.imit.scaleY ?? 1,
           }
         : null,
     };
@@ -429,6 +575,8 @@ export class EsTrainer {
         type: "eval", jobId,
         theta: copy.buffer, layout: this.layout, reward: this.reward,
         rolloutSteps: this.rolloutSteps,
+        runCfg: this.runCfg,
+        cmdScale: this.cmdScale,
         targetPoint: this.pointSnapshot ? [...this.pointSnapshot] : null,
       },
       [copy.buffer],
@@ -450,7 +598,10 @@ export class EsTrainer {
       await Promise.all(
         members.map(async (m, i) => {
           const r = await this.evalViaWorker(m);
-          results[i] = r;
+          results[i] = {
+            fitness: Number.isFinite(r.fitness) ? r.fitness : -100,
+            fell: r.fell,
+          };
         }),
       );
     } else {
@@ -467,20 +618,23 @@ export class EsTrainer {
             n: 0, t: 0, sum: 0, fell: false, done: false,
             prevAct: new Float32Array(this.layout.actionDim),
             act: new Float32Array(this.layout.actionDim),
+            cmd: new Float32Array(Math.max(3, this.meta.cmdSize)),
+            pushTimer: 100,
+            poisoned: false,
           };
-          resetCtx(this.engine, ctx);
+          resetCtx(this.engine, ctx, this.runCfg, this.cmdScale);
           return ctx;
         });
         while (ctxs.some((c) => !c.done)) {
           for (const ctx of ctxs) {
             if (!ctx.done) {
-              ctxStep(this.engine, ctx, this.reward, this.imit, this.imitBuf, this.policyDt);
+              ctxStep(this.engine, ctx, this.reward, this.runCfg, this.imit, this.imitBuf, this.policyDt);
             }
           }
           await new Promise<void>((r) => setTimeout(r, 0)); // UI-Yield
         }
         for (let i = 0; i < ctxs.length; i++) {
-          results[batch + i] = { fitness: finishCtx(ctxs[i]), fell: ctxs[i].fell };
+          results[batch + i] = { fitness: finishCtx(ctxs[i], this.runCfg), fell: ctxs[i].fell };
           this.stepsCounter += ctxs[i].n;
           this.dataPool.push(ctxs[i].data); // zurück in den Pool statt GC/Leak
         }
@@ -495,6 +649,15 @@ export class EsTrainer {
 
   setReward(cfg: RewardConfig): void {
     this.reward = cfg;
+  }
+
+  /** v2.3: Profi-Tricks setzen (immer sanitiert). */
+  setRunCfg(cfg: Partial<RunCfg> | null | undefined): void {
+    this.runCfg = sanitizeRunCfg(cfg);
+  }
+
+  getRunCfg(): RunCfg {
+    return { ...this.runCfg };
   }
 
   /** Eine ES-Generation: antithetisches Sampling → Evaluierung → Update. */
@@ -540,15 +703,34 @@ export class EsTrainer {
       this.theta[j] += grad[j] * norm;
     }
 
+    // v2.3: Weight-Decay – hält Theta klein (tanh bleibt sensitiv, kein Drift)
+    if (this.runCfg.weightDecay > 0) {
+      const wd = this.runCfg.weightDecay;
+      for (let j = 0; j < this.theta.length; j++) this.theta[j] *= 1 - wd;
+    }
+
     const bestIdx = order[n - 1];
     const bestFit = results[bestIdx].fitness;
-    const meanFit = results.reduce((s, r) => s + r.fitness, 0) / n;
+    let meanFit = 0;
+    for (const r of results) meanFit += Number.isFinite(r.fitness) ? r.fitness : 0;
+    meanFit /= n;
     this.generation++;
     this.lastGenBest = bestFit;
     this.lastGenMean = meanFit;
     this.lastFellRate = results.filter((r) => r.fell).length / n;
     this.history.push(bestFit);
     if (this.history.length > 200) this.history.shift();
+
+    // v2.3: Curriculum – Tempo hoch bei wenig Stürzen, runter bei vielen
+    if (this.runCfg.curriculum) {
+      if (this.lastFellRate < CURRICULUM_UP && this.cmdScale < 1) {
+        this.cmdScale = Math.min(1, this.cmdScale + 0.15);
+      } else if (this.lastFellRate > CURRICULUM_DOWN && this.cmdScale > 0.15) {
+        this.cmdScale = Math.max(0.15, this.cmdScale - 0.1);
+      }
+    } else {
+      this.cmdScale = 1;
+    }
 
     if (bestFit > this.bestEver) {
       this.bestEver = bestFit;
@@ -601,6 +783,8 @@ export interface WorkerInitPayload {
   imitation: {
     dim: number; frames: number; fps: number; duration: number;
     targets: ArrayBufferLike; rootY: ArrayBufferLike; baseY: number;
+    center: ArrayBufferLike | null; // v2.3: Ruhelage (Gelenkwinkel)
+    scaleY: number; // v2.3: Höhen-Skalierung (Cross-Species)
   } | null;
 }
 

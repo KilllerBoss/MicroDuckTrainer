@@ -23,6 +23,7 @@ import {
   buildImitClip, targetAt, rootDeltaAt, saveImitPrefs,
   type ImitClip,
 } from "./imitation";
+import { defaultRunCfg, type RunCfg } from "./es";
 
 
 export type Mode = "manuell" | "training" | "test";
@@ -63,10 +64,18 @@ export interface TrainCfg {
   lr: number;
   /** Start-/Basis-Sigma (Rauschen). */
   sigma: number;
+  /** v2.3: Sichtbarer Sim-Tempo-Faktor (Physik + Roboter schneller!). */
+  speedMult: 1 | 2 | 4 | 8;
+  /** v2.3: Profi-Tricks (cmd-Zufall, Glättung, Stöße, Curriculum …). */
+  runCfg: RunCfg;
 }
 
 export function defaultTrainCfg(): TrainCfg {
-  return { rolloutSteps: 200, maxGenerations: 0, lr: 0.03, sigma: 0.08 };
+  return {
+    rolloutSteps: 200, maxGenerations: 0, lr: 0.03, sigma: 0.08,
+    speedMult: 1,
+    runCfg: defaultRunCfg(),
+  };
 }
 
 export interface Telemetry {
@@ -344,13 +353,19 @@ export class TrainerCore {
     this.setReward(next);
   }
 
-  /** v2.2: Rundenlänge / Ziel-Generationen / lr / sigma. */
+  /** v2.2: Rundenlänge / Ziel-Generationen / lr / sigma / Tempo / Profi-Tricks. */
   setTrainCfg(patch: Partial<TrainCfg>): void {
     const next: TrainCfg = { ...this.trainCfg };
     if (Number.isFinite(patch.rolloutSteps)) next.rolloutSteps = clamp(Math.round(patch.rolloutSteps!), 30, 1000);
     if (Number.isFinite(patch.maxGenerations)) next.maxGenerations = clamp(Math.round(patch.maxGenerations!), 0, 100000);
     if (Number.isFinite(patch.lr)) next.lr = clamp(patch.lr!, 0.002, 0.2);
     if (Number.isFinite(patch.sigma)) next.sigma = clamp(patch.sigma!, 0.005, 0.3);
+    if (patch.speedMult === 1 || patch.speedMult === 2 || patch.speedMult === 4 || patch.speedMult === 8) {
+      next.speedMult = patch.speedMult;
+    }
+    if (patch.runCfg && typeof patch.runCfg === "object") {
+      next.runCfg = { ...next.runCfg, ...patch.runCfg };
+    }
     this.trainCfg = next;
     if (this.modelId) saveTrainPrefs(this.modelId, next);
     this.applyTrainCfg();
@@ -365,6 +380,7 @@ export class TrainerCore {
     t.sigma = this.trainCfg.sigma;
     t.baseSigma = this.trainCfg.sigma;
     t.maxGenerations = this.trainCfg.maxGenerations;
+    t.setRunCfg(this.trainCfg.runCfg); // v2.3: Profi-Tricks
   }
 
   setJoystick(x: number, y: number) {
@@ -447,6 +463,7 @@ export class TrainerCore {
       this.leader = null; // Momentum neu starten
       this.trail = [];
       if (next.mode === "aus") this.world?.setTargetPath(null);
+      this.world?.setTargetArc(null, [0, 0]);
     }
     const active = next.mode !== "aus";
     if (!active) {
@@ -482,7 +499,14 @@ export class TrainerCore {
       this.esView = null;
       this.esObsExtra = 0;
       const meta = getModel(modelId);
-      const clip = await buildImitClip(buffer, clipIndex, meta, mirror);
+      // v2.3: Center = aktuelle Ruhelage des Roboters (G1: Stand-Pose mit
+      // entspannten Armen) + Zielhöhe für Cross-Species-Skalierung.
+      const clip = await buildImitClip(
+        buffer, clipIndex, meta, mirror,
+        this.engine.standPose.length === meta.actionDim
+          ? this.engine.standPose : null,
+        meta.targetHeight,
+      );
       if (clip.mapped === 0) {
         return { ok: false, message: "Keine Gelenke gemappt – Skeleton-Namen nicht erkannt." };
       }
@@ -601,6 +625,7 @@ export class TrainerCore {
             dim: this.imitClip.dim, frames: this.imitClip.frames, fps: this.imitClip.fps,
             duration: this.imitClip.duration, targets: this.imitClip.targets,
             rootY: this.imitClip.rootY, baseY: this.imitClip.baseY,
+            center: this.imitClip.center, scaleY: this.imitClip.scaleY,
           }
         : null;
       const imitSig = this.imitClip
@@ -838,11 +863,17 @@ export class TrainerCore {
     let hzT0 = next;
     while (this.running) {
       try {
-        await this.controlStep();
+        // v2.3: Speed-Sync – bei Tempo 2×/4×/8× laufen genauso viele Policy-
+        // Steps pro Tick zurück wie die Wanduhr real zulässt. Physik, Roboter
+        // UND Umgebung (Animation/Punkt) bewegen sich synchron schneller.
+        const steps = this.trainCfg.speedMult;
+        for (let i = 0; i < steps; i++) {
+          await this.controlStep();
+        }
+        count += steps;
       } catch (err) {
         console.warn("[core] controlStep:", err);
       }
-      count++;
       const now = performance.now();
       if (now - hzT0 > 500) {
         this.ctrlHz = (count * 1000) / (now - hzT0);
@@ -873,8 +904,23 @@ export class TrainerCore {
       const rx = fy, ry = -fx; // rechts = (f_y, -f_x)
       const sp = 1.4 * dtStep;
       const lim = arenaHalf(this.modelId) - 0.15;
-      this.point[0] = clamp(this.point[0] + (this.joy.y * fx + this.joy.x * rx) * sp, -lim, lim);
-      this.point[1] = clamp(this.point[1] + (this.joy.y * fy + this.joy.x * ry) * sp, -lim, lim);
+      // v2.3: Bei losgelassenem Joystick gleitet der Punkt bei Umkreis/Pfad
+      // sanft zurück zum Roboter (wie in Games: Marker schwebt zum Charakter).
+      const joyActive = Math.abs(this.joy.x) > 0.06 || Math.abs(this.joy.y) > 0.06;
+      if (!joyActive && (pm === "umkreis" || pm === "pfad")) {
+        const pR = engine.torsoPos();
+        const dx = pR[0] - this.point[0], dy = pR[1] - this.point[1];
+        const d = Math.hypot(dx, dy);
+        const rest = Math.min(0.45, this.pointCfg.radius * 0.5); // Ruhekugel um den Roboter
+        if (d > rest) {
+          const glide = Math.min(d - rest, d * 3 * dtStep + 0.3 * dtStep);
+          this.point[0] += (dx / d) * glide;
+          this.point[1] += (dy / d) * glide;
+        }
+      } else {
+        this.point[0] = clamp(this.point[0] + (this.joy.y * fx + this.joy.x * rx) * sp, -lim, lim);
+        this.point[1] = clamp(this.point[1] + (this.joy.y * fy + this.joy.x * ry) * sp, -lim, lim);
+      }
 
       // Umkreis/Pfad: Punkt darf max. `radius` vom Roboter entfernt bleiben
       const p0 = engine.torsoPos();
@@ -916,12 +962,15 @@ export class TrainerCore {
       this.trainer?.setTargetPoint(target);
       this.world?.setTargetPoint(this.point[0], this.point[1], true);
       this.markerShown = true;
-      this.world?.setTargetPath(pm === "pfad" && this.trail.length >= 2 ? this.trail : null);
+      // v2.3: Schwebende Spiel-Kurve Roboter → Punkt (statt Bodenpfad)
+      this.world?.setTargetArc(p0, this.point);
+      this.world?.setTargetPath(null);
     } else if (engine.targetPoint || this.markerShown) {
       engine.targetPoint = null;
       this.trainer?.setTargetPoint(null);
       this.world?.setTargetPoint(0, 0, false);
       this.world?.setTargetPath(null);
+      this.world?.setTargetArc(null, [0, 0]);
       this.markerShown = false;
     }
 
@@ -954,7 +1003,8 @@ export class TrainerCore {
     }
 
     if (this.mode === "test") {
-      this.testUptime = (performance.now() - this.testStart) / 1000;
+      // v2.3: Sim-Zeit (Steps × dt) statt Wanduhr – korrekt auch bei Tempo 4×
+      this.testUptime = this.testStepN * (this.stepMs() / 1000);
     }
   }
 
@@ -1067,10 +1117,12 @@ export class TrainerCore {
 
     if (this.mode === "test") {
       this.testStepN++;
-      this.testReward += stepRewardValue(
+      const r = stepRewardValue(
         engine, this.rewardCfg!, this.actBuf, this.prevAct,
         { t: this.testUptime, step: this.testStepN, dt: this.stepMs() / 1000 },
       );
+      // v2.3: NaN darf den kumulierten Reward nie vergiften
+      if (Number.isFinite(r)) this.testReward += r;
       this.prevAct.set(this.actBuf);
     }
   }
@@ -1158,10 +1210,11 @@ export class TrainerCore {
     engine.stepWithAction(act);
     if (this.mode === "test") {
       this.testStepN++;
-      this.testReward += stepRewardValue(
+      const r = stepRewardValue(
         engine, this.rewardCfg!, act, this.prevAct,
         { t: this.testUptime, step: this.testStepN, dt: this.stepMs() / 1000 },
       );
+      if (Number.isFinite(r)) this.testReward += r;
       this.prevAct.set(act);
     }
   }
@@ -1273,7 +1326,11 @@ export class TrainerCore {
       imitation: this.imitClip
         ? {
             name: this.imitClip.name, duration: this.imitClip.duration,
-            playing: this.imitPlaying, time: this.imitTime,
+            playing: this.imitPlaying,
+            // v2.3: Anzeigezeit wrappen (49.2/9.0 s → 4.2/9.0 s)
+            time: this.imitClip.duration > 0
+              ? this.imitTime % this.imitClip.duration
+              : this.imitTime,
             mapped: this.imitClip.mapped, manual: this.imitManual,
           }
         : null,
@@ -1387,6 +1444,8 @@ function loadTrainPrefs(modelId: ModelId): TrainCfg {
           maxGenerations: Number.isFinite(p.maxGenerations) ? clamp(Math.round(p.maxGenerations!), 0, 100000) : def.maxGenerations,
           lr: Number.isFinite(p.lr) ? clamp(p.lr!, 0.002, 0.2) : def.lr,
           sigma: Number.isFinite(p.sigma) ? clamp(p.sigma!, 0.005, 0.3) : def.sigma,
+          speedMult: p.speedMult === 2 || p.speedMult === 4 || p.speedMult === 8 ? p.speedMult : 1,
+          runCfg: { ...def.runCfg, ...(p.runCfg && typeof p.runCfg === "object" ? p.runCfg : {}) },
         };
       }
     }

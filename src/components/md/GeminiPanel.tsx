@@ -123,12 +123,18 @@ export default function GeminiPanel({ tel, onApplyPatch, onTurbo }: GeminiPanelP
         : undefined,
       turbo: tr?.turbo ?? patch.turbo,
       resetFirst: tr?.resetFirst ?? patch.resetFirst,
-      training: tr
+      training: tr || patch.runCfg
         ? {
-            rolloutSteps: tr.rolloutSteps,
-            maxGenerations: tr.generations,
-            lr: tr.lr,
-            sigma: tr.sigma,
+            ...(tr
+              ? {
+                  rolloutSteps: tr.rolloutSteps,
+                  maxGenerations: tr.generations,
+                  lr: tr.lr,
+                  sigma: tr.sigma,
+                }
+              : {}),
+            // v2.3: Profi-Tricks aus Gemini-Patch
+            ...(patch.runCfg ? { runCfg: { ...tel.trainCfg.runCfg, ...patch.runCfg } } : {}),
           }
         : undefined,
     });

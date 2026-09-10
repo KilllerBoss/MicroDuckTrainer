@@ -1,6 +1,6 @@
 "use client";
 
-// ── MicroDuck Trainer v2.2 – Trainings-Panel (OpenAI-ES) ─────────────────────
+// ── MicroDuck Trainer v2.3 – Trainings-Panel (OpenAI-ES + Profi-Tricks) ─────
 
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -9,9 +9,9 @@ import { Badge } from "@/components/ui/badge";
 import { Slider } from "@/components/ui/slider";
 import FitnessChart from "./FitnessChart";
 import type { Telemetry } from "@/lib/md/app-core";
-import { TURBO_LEVELS, type TurboLevel } from "@/lib/md/es";
+import { TURBO_LEVELS, type TurboLevel, type RunCfg } from "@/lib/md/es";
 import {
-  Play, Square, Eye, Save, FolderOpen, Download, Upload, Timer,
+  Play, Square, Eye, Save, FolderOpen, Download, Upload, Timer, Gauge, Wand2,
 } from "lucide-react";
 
 interface TrainingPanelProps {
@@ -35,6 +35,8 @@ function fmt(n: number | undefined | null, digits = 2): string {
   return n.toFixed(digits);
 }
 
+const SPEED_LEVELS: (1 | 2 | 4 | 8)[] = [1, 2, 4, 8];
+
 export default function TrainingPanel(props: TrainingPanelProps) {
   const {
     tel, turbo, onTurbo, onStart, onStop, onShowBest, onSave, onLoad, hasSaved,
@@ -42,10 +44,13 @@ export default function TrainingPanel(props: TrainingPanelProps) {
   } = props;
   const es = tel.es;
   const [watchBest, setWatchBest] = useState(false);
+  const [showPro, setShowPro] = useState(false);
   const cfg = tel.trainCfg;
+  const rc: RunCfg = cfg.runCfg;
   const genProgress = cfg.maxGenerations > 0 && es
     ? Math.min(100, (es.generation / cfg.maxGenerations) * 100)
     : null;
+  const setRun = (p: Partial<RunCfg>) => onTrainCfg({ runCfg: { ...rc, ...p } });
 
   return (
     <div className="space-y-4">
@@ -84,6 +89,32 @@ export default function TrainingPanel(props: TrainingPanelProps) {
             </button>
           ))}
         </div>
+      </div>
+
+      {/* v2.3: Sichtbares Sim-Tempo (Physik + Roboter synchron schneller) */}
+      <div className="flex items-center gap-2">
+        <Gauge className="h-4 w-4 shrink-0 text-amber-300" />
+        <span className="text-[11px] uppercase tracking-wide text-slate-500">Tempo</span>
+        <div className="flex overflow-hidden rounded-lg border border-amber-500/25">
+          {SPEED_LEVELS.map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => onTrainCfg({ speedMult: s })}
+              className={`h-9 px-3 font-mono text-xs transition-colors ${
+                cfg.speedMult === s
+                  ? "bg-amber-500/25 text-amber-200"
+                  : "text-slate-400 hover:bg-white/5"
+              }`}
+              title={`Simulation läuft ${s}× so schnell (Physik, Roboter und Umgebung synchron)`}
+            >
+              {s}×
+            </button>
+          ))}
+        </div>
+        <span className="text-[10px] leading-tight text-slate-600">
+          Roboter &amp; Physik laufen<br />synchron schneller
+        </span>
       </div>
 
       {/* Status */}
@@ -217,6 +248,86 @@ export default function TrainingPanel(props: TrainingPanelProps) {
             Mehr Rauschen = mehr Entdeckung, weniger Feinschliff.
           </p>
         </div>
+      </div>
+
+      {/* v2.3: Profi-Tricks (auf/zu) */}
+      <div className="rounded-lg border border-violet-500/25 bg-violet-500/5">
+        <button
+          type="button"
+          onClick={() => setShowPro(!showPro)}
+          className="flex w-full items-center justify-between px-3 py-2.5"
+        >
+          <span className="flex items-center gap-2 text-xs font-semibold text-violet-300">
+            <Wand2 className="h-4 w-4" /> Profi-Tricks (aktiv)
+          </span>
+          <span className="text-[10px] text-violet-400/70">{showPro ? "▲" : "▼"}</span>
+        </button>
+        {showPro && (
+          <div className="space-y-3 border-t border-violet-500/20 p-3">
+            <p className="text-[10px] leading-relaxed text-slate-500">
+              Genau die Techniken, mit denen Profi-Teams (Unitree, ANYmal, Berkeley)
+              Lauf-Roboter trainieren – hier ein/aus schaltbar.
+            </p>
+            {[
+              { k: "cmdTrain" as const, label: "Zufalls-Tempo je Runde", desc: "Jede Runde neues Tempo/Richtung → Roboter lernt überall zu gehen (Joystick-fähig)" },
+              { k: "curriculum" as const, label: "Curriculum", desc: "Zu viele Stürze → Tempo automatisch runter; läuft es → automatisch rauf" },
+              { k: "pushes" as const, label: "Zufalls-Stöße", desc: "Rempelt den Roboter an → wird robust gegen Stöße (Domain Randomization)" },
+              { k: "noiseReset" as const, label: "Start-Rauschen", desc: "Jeder Start leicht anders → keine Memory-Löcher, robustere Gelenkwinkel" },
+            ].map((row) => (
+              <div key={row.k} className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-xs text-slate-200">{row.label}</div>
+                  <div className="text-[10px] leading-snug text-slate-500">{row.desc}</div>
+                </div>
+                <Switch
+                  checked={rc[row.k]}
+                  onCheckedChange={(v) => setRun({ [row.k]: v } as Partial<RunCfg>)}
+                  aria-label={row.label}
+                />
+              </div>
+            ))}
+            <div>
+              <div className="mb-1 flex justify-between text-[11px] text-slate-400">
+                <span>Aktions-Glättung (gegen Zittern)</span>
+                <span className="font-mono text-violet-300">{rc.actionSmooth.toFixed(2)}</span>
+              </div>
+              <Slider
+                value={[rc.actionSmooth]}
+                min={0.3}
+                max={1}
+                step={0.05}
+                onValueChange={(v) => setRun({ actionSmooth: v[0] })}
+              />
+              <p className="mt-0.5 text-[10px] text-slate-600">
+                Niedriger = ruhigere Bewegung (0.6 empfohlen), 1.0 = aus.
+              </p>
+            </div>
+            <div>
+              <div className="mb-1 flex justify-between text-[11px] text-slate-400">
+                <span>Ziel-Tempo beim Training (m/s)</span>
+                <span className="font-mono text-violet-300">{rc.cmdFwd.toFixed(2)}</span>
+              </div>
+              <Slider
+                value={[rc.cmdFwd]}
+                min={0.1}
+                max={0.8}
+                step={0.05}
+                onValueChange={(v) => setRun({ cmdFwd: v[0] })}
+              />
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-xs text-slate-200">Überlebens-Fitness</div>
+                <div className="text-[10px] leading-snug text-slate-500">Wer länger nicht fällt, gewinnt (statt Durchschnitt)</div>
+              </div>
+              <Switch
+                checked={rc.fitnessMode === "sum"}
+                onCheckedChange={(v) => setRun({ fitnessMode: v ? "sum" : "mean" })}
+                aria-label="Überlebens-Fitness"
+              />
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Aktionen */}

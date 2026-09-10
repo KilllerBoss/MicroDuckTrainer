@@ -181,6 +181,20 @@ export class Engine {
   resetToKeyframe(): void {
     if (!this.model || !this.data) return;
     this.mujoco!.mj_resetDataKeyframe(this.model, this.data, this.addrs.keyId);
+    // v2.3: G1-Arme natürlicher (Ellbogen ~26° statt 90°, Schultern leicht
+    // nach hinten) – Keyframe hat die "Roboter-90°-Haltung". Auch im Worker!
+    if (this.meta.id === "unitree_g1") {
+      const relax: Record<string, number> = {
+        left_shoulder_pitch_joint: 0.35, right_shoulder_pitch_joint: 0.35,
+        left_shoulder_roll_joint: 0.1, right_shoulder_roll_joint: -0.1,
+        left_elbow_joint: 0.45, right_elbow_joint: 0.45,
+      };
+      const qposRelax = this.data.qpos as Float32Array;
+      for (let j = 0; j < this.meta.jointNames.length; j++) {
+        const r = relax[this.meta.jointNames[j]];
+        if (r !== undefined) qposRelax[this.addrs.qposAdr[j]] = r;
+      }
+    }
     this.mujoco!.mj_forward(this.model, this.data);
     // Stand-Pose aus dem Keyframe lesen (G1: Ellbogen 1.28 rad etc.)
     const qpos = this.data.qpos as Float32Array;

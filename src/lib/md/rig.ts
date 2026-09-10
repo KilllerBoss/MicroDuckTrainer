@@ -316,6 +316,8 @@ export interface World {
   getCamYaw: () => number;
   /** v2.2: Pfad-Trail setzen (MuJoCo x/y-Punkte) oder ausblenden (null). */
   setTargetPath: (pts: [number, number][] | null) => void;
+  /** v2.3: Schwebende Spiel-Kurve Roboter → Punkt (Beacon-Arc) statt Bodenpfad. */
+  setTargetArc: (from: [number, number, number] | null, to: [number, number]) => void;
   dispose: () => void;
 }
 
@@ -425,6 +427,42 @@ export async function createWorld(container: HTMLElement): Promise<World> {
   pathLine.visible = false;
   scene.add(pathLine);
 
+  // v2.3: Schwebende Spiel-Kurve (Beacon-Arc) vom Roboter zum Ziel-Punkt –
+  // wie in Games: leuchtender Bogen in der Luft + Pulse, die zum Ziel fließen.
+  const ARC_PTS = 40;
+  const arcGeom = new THREE.BufferGeometry();
+  arcGeom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array(ARC_PTS * 3), 3),
+  );
+  const arcLine = new THREE.Line(
+    arcGeom,
+    new THREE.LineBasicMaterial({
+      color: 0xffc36b,
+      transparent: true,
+      opacity: 0.9,
+      depthWrite: false,
+    }),
+  );
+  arcLine.frustumCulled = false;
+  arcLine.visible = false;
+  scene.add(arcLine);
+  const arcPulses: THREE.Mesh[] = [];
+  for (let i = 0; i < 3; i++) {
+    const dot = new THREE.Mesh(
+      new THREE.SphereGeometry(0.022, 10, 8),
+      new THREE.MeshBasicMaterial({ color: 0xffd28a, transparent: true, opacity: 0.95 }),
+    );
+    dot.visible = false;
+    scene.add(dot);
+    arcPulses.push(dot);
+  }
+  let arcTime = 0;
+  const _arcA = new THREE.Vector3();
+  const _arcC = new THREE.Vector3();
+  const _arcB = new THREE.Vector3();
+  const _arcP = new THREE.Vector3();
+
   let duckRig: DuckRig | null = null;
   let g1Rig: G1Rig | null = null;
 
@@ -502,12 +540,56 @@ export async function createWorld(container: HTMLElement): Promise<World> {
       pathGeom.computeBoundingSphere();
       pathLine.visible = true;
     },
+    setTargetArc(from, to) {
+      if (!from) {
+        arcLine.visible = false;
+        for (const d of arcPulses) d.visible = false;
+        return;
+      }
+      // MuJoCo (x,y,z) → three (x, z_up, -y); Ziel schwebt auf ~0.35 m
+      _arcA.set(from[0], Math.max(0.15, from[2]), -from[1]);
+      _arcB.set(to[0], 0.35, -to[1]);
+      const d = _arcA.distanceTo(_arcB);
+      // Kontrollpunkt: Mitte, angehoben – höher je weiter weg (schöner Bogen)
+      _arcC.set(
+        (_arcA.x + _arcB.x) / 2,
+        Math.max(_arcA.y, _arcB.y) + Math.min(0.7, 0.15 + d * 0.25),
+        (_arcA.z + _arcB.z) / 2,
+      );
+      const pos = arcGeom.attributes.position as THREE.BufferAttribute;
+      for (let i = 0; i < ARC_PTS; i++) {
+        const t = i / (ARC_PTS - 1);
+        // Quadratische Bezier: P = (1-t)²A + 2(1-t)t·C + t²B
+        const mt = 1 - t;
+        _arcP.set(
+          mt * mt * _arcA.x + 2 * mt * t * _arcC.x + t * t * _arcB.x,
+          mt * mt * _arcA.y + 2 * mt * t * _arcC.y + t * t * _arcB.y,
+          mt * mt * _arcA.z + 2 * mt * t * _arcC.z + t * t * _arcB.z,
+        );
+        pos.setXYZ(i, _arcP.x, _arcP.y, _arcP.z);
+      }
+      pos.needsUpdate = true;
+      arcGeom.computeBoundingSphere();
+      arcLine.visible = true;
+      // Pulse fließen zum Ziel (dt kommt aus updateCamera)
+      for (let i = 0; i < arcPulses.length; i++) {
+        const tt = (arcTime * 0.6 + i / arcPulses.length) % 1;
+        const mt = 1 - tt;
+        arcPulses[i].position.set(
+          mt * mt * _arcA.x + 2 * mt * tt * _arcC.x + tt * tt * _arcB.x,
+          mt * mt * _arcA.y + 2 * mt * tt * _arcC.y + tt * tt * _arcB.y,
+          mt * mt * _arcA.z + 2 * mt * tt * _arcC.z + tt * tt * _arcB.z,
+        );
+        arcPulses[i].visible = true;
+      }
+    },
     updateCamera(dt) {
       if (marker.visible) {
         markerPulse += dt * 5;
         const k = 1 + Math.sin(markerPulse) * 0.12;
         markerRing.scale.setScalar(k);
       }
+      if (arcLine.visible) arcTime += dt;
       smoothTarget.lerp(target, Math.min(1, dt * 6));
       const cp = new THREE.Vector3(
         smoothTarget.x + camSph.dist * Math.cos(camSph.pitch) * Math.cos(camSph.yaw),

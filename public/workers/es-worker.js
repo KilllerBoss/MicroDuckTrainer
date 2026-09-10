@@ -10,10 +10,47 @@ let ctx = null; // { modelId, obsDim, actionDim, cmdSize, obsType, decimation, a
 let addrs = null; // { qposAdr, dofAdr, gyroAdr, torsoId, ballQposAdr, ballDofAdr, ctrlRange, jntRange }
 let standPose = null;
 let data = null;
-let imit = null; // { dim, frames, fps, duration, targets, rootY, baseY }
+let imit = null; // { dim, frames, fps, duration, targets, rootY, baseY, center, scaleY }
 let imitBuf = null;
 let policyDt = 0.02;
 let pointSnapshot = null; // [x, y] | null (Punkt-Modus, Snapshot je Eval)
+
+// ── v2.3: Profi-Tricks (identisch zu src/lib/md/es.ts) ──
+function defaultRunCfg() {
+  return {
+    cmdTrain: true, cmdFwd: 0.3, cmdLat: 0.15, cmdAng: 0.8,
+    curriculum: true, actionSmooth: 0.6, pushes: true, noiseReset: true,
+    fitnessMode: "sum", weightDecay: 0.005,
+  };
+}
+function sanitizeRunCfg(p) {
+  const d = defaultRunCfg();
+  if (!p || typeof p !== "object") return d;
+  const num = (v, def, lo, hi) =>
+    typeof v === "number" && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : def;
+  return {
+    cmdTrain: typeof p.cmdTrain === "boolean" ? p.cmdTrain : d.cmdTrain,
+    cmdFwd: num(p.cmdFwd, d.cmdFwd, 0, 1.2),
+    cmdLat: num(p.cmdLat, d.cmdLat, 0, 0.6),
+    cmdAng: num(p.cmdAng, d.cmdAng, 0, 2),
+    curriculum: typeof p.curriculum === "boolean" ? p.curriculum : d.curriculum,
+    actionSmooth: num(p.actionSmooth, d.actionSmooth, 0.2, 1),
+    pushes: typeof p.pushes === "boolean" ? p.pushes : d.pushes,
+    noiseReset: typeof p.noiseReset === "boolean" ? p.noiseReset : d.noiseReset,
+    fitnessMode: p.fitnessMode === "mean" ? "mean" : "sum",
+    weightDecay: num(p.weightDecay, d.weightDecay, 0, 0.05),
+  };
+}
+function drawCmd(cfg, cmdScale, out) {
+  if (cfg.cmdTrain) {
+    out[0] = Math.random() * cfg.cmdFwd * cmdScale;
+    if (out.length > 1) out[1] = (Math.random() * 2 - 1) * cfg.cmdLat * cmdScale;
+    if (out.length > 2) out[2] = (Math.random() * 2 - 1) * cfg.cmdAng * cmdScale;
+  } else {
+    out.fill(0);
+    out[0] = 0.25 * cmdScale;
+  }
+}
 
 // ── v2.2: KI-Code-Term (identisch zu src/lib/md/customcode.ts) ──
 const FORBIDDEN = /\b(import|require|eval|Function|fetch|XMLHttpRequest|localStorage|sessionStorage|indexedDB|document|window|globalThis|self|postMessage|Worker|WebSocket)\b/;
@@ -108,6 +145,8 @@ async function boot(payload) {
       targets: new Float32Array(ctx.imitation.targets),
       rootY: new Float32Array(ctx.imitation.rootY),
       baseY: ctx.imitation.baseY,
+      center: ctx.imitation.center ? new Float32Array(ctx.imitation.center) : null,
+      scaleY: ctx.imitation.scaleY ?? 1,
     };
     imitBuf = new Float32Array(imit.dim);
   }
@@ -159,7 +198,22 @@ async function boot(payload) {
 
 function resetToKeyframe() {
   mujoco.mj_resetDataKeyframe(model, data, keyId);
-  mujoco.mj_forward(model, data);
+  // v2.3: G1-Arme natürlicher (Ellbogen ~26° statt 90°) – identisch zur Engine
+  if (ctx.modelId === "unitree_g1") {
+    const relax = {
+      left_shoulder_pitch_joint: 0.35, right_shoulder_pitch_joint: 0.35,
+      left_shoulder_roll_joint: 0.1, right_shoulder_roll_joint: -0.1,
+      left_elbow_joint: 0.45, right_elbow_joint: 0.45,
+    };
+    const qpos = data.qpos;
+    for (let j = 0; j < ctx.jointNames.length; j++) {
+      const r = relax[ctx.jointNames[j]];
+      if (r !== undefined) qpos[addrs.qposAdr[j]] = r;
+    }
+    mujoco.mj_forward(model, data);
+  } else {
+    mujoco.mj_forward(model, data);
+  }
   const qpos = data.qpos;
   standPose = new Float32Array(ctx.actionDim);
   for (let j = 0; j < ctx.actionDim; j++) standPose[j] = qpos[addrs.qposAdr[j]];
@@ -249,12 +303,17 @@ function imitSampleAt(d, t, out) {
   const f0 = Math.min(d.frames - 1, Math.floor(x));
   const f1 = Math.min(d.frames - 1, f0 + 1);
   const u = x - f0;
+  const center = d.center;
   for (let j = 0; j < d.dim; j++) {
     const a = d.targets[f0 * d.dim + j];
     const b = d.targets[f1 * d.dim + j];
-    out[j] = a + (b - a) * u;
+    let v = a + (b - a) * u;
+    if (center && j < center.length) v += center[j];
+    out[j] = Number.isFinite(v) ? v : (center ? center[j] : 0);
   }
-  return (d.rootY[f0] + (d.rootY[f1] - d.rootY[f0]) * u) - d.baseY;
+  const raw = (d.rootY[f0] + (d.rootY[f1] - d.rootY[f0]) * u) - d.baseY;
+  const s = d.scaleY ?? 1;
+  return Number.isFinite(raw) ? raw * s : 0;
 }
 
 function isFallen() {
@@ -283,8 +342,22 @@ function mlpForward(layout, w1, b1, w2, b2, obs, hiddenBuf, act) {
   return act;
 }
 
-function runRollout(theta, layout, reward, steps, targetPoint) {
+function runRollout(theta, layout, reward, steps, targetPoint, runCfg, cmdScale) {
+  runCfg = sanitizeRunCfg(runCfg);
+  cmdScale = typeof cmdScale === "number" && Number.isFinite(cmdScale)
+    ? Math.min(1, Math.max(0.1, cmdScale)) : 0.4;
   resetToKeyframe();
+  // v2.3: Reset-Rauschen (jeder Start leicht anders)
+  if (runCfg.noiseReset) {
+    const qp = data.qpos;
+    const qv = data.qvel;
+    for (let j = 0; j < addrs.qposAdr.length; j++) qp[addrs.qposAdr[j]] += (Math.random() * 2 - 1) * 0.04;
+    for (let j = 0; j < Math.min(6, qv.length); j++) qv[j] += (Math.random() * 2 - 1) * 0.08;
+    mujoco.mj_forward(model, data);
+  }
+  // v2.3: Zufalls-Bewegungsbefehl für diese Runde
+  const cmd = new Float32Array(ctx.cmdSize >= 3 ? ctx.cmdSize : 3);
+  drawCmd(runCfg, cmdScale, cmd);
   const o = layout.obsDim, h = layout.hidden;
   const w1 = theta.slice(0, h * o);
   const b1 = theta.slice(h * o, h * o + h);
@@ -313,7 +386,9 @@ function runRollout(theta, layout, reward, steps, targetPoint) {
   } : null;
   let sum = 0, n = 0, fell = false;
   let tImit = 0; // Imitations-Zeit (s)
-  for (let t = 0; t < steps; t++) {
+  let pushTimer = 60 + Math.floor(Math.random() * 60);
+  let poisoned = false;
+  for (let t = 0; t < steps && !poisoned; t++) {
     if (imit && imitBuf) {
       imitRootDelta = imitSampleAt(imit, tImit, imitBuf);
       imitTarget = imitBuf;
@@ -322,9 +397,28 @@ function runRollout(theta, layout, reward, steps, targetPoint) {
     }
     buildObs(lastAction, cmd, obs);
     mlpForward(layout, w1, b1, w2, b2, obs, hiddenBuf, act);
+    // v2.3: Aktions-EMA-Glättung (gegen Zittern)
+    const alpha = runCfg.actionSmooth;
+    if (alpha < 1) {
+      for (let j = 0; j < act.length; j++) {
+        act[j] = alpha * act[j] + (1 - alpha) * prevAct[j];
+      }
+    }
     lastAction.set(act);
     stepWithAction(act);
     n++;
+    // v2.3: Zufalls-Stöße (Domain Randomization)
+    if (runCfg.pushes && n > 40) {
+      if (--pushTimer <= 0) {
+        pushTimer = 80 + Math.floor(Math.random() * 120);
+        const qv = data.qvel;
+        if (qv.length >= 6) {
+          qv[0] += (Math.random() * 2 - 1) * 0.35;
+          qv[1] += (Math.random() * 2 - 1) * 0.35;
+          qv[5] += (Math.random() * 2 - 1) * 0.28;
+        }
+      }
+    }
     // ── Reward-Terme (identisch zur Main-Thread-Variante) ──
     const gz = projGravZ();
     const upZ = Math.max(0, Math.min(1, -gz));
@@ -431,13 +525,28 @@ function runRollout(theta, layout, reward, steps, targetPoint) {
     sum += val;
     tImit += policyDt;
     prevAct.set(act);
+    // v2.3: NaN-Schutz – divergierte Physik beendet die Runde sofort
+    if (!Number.isFinite(sum) || !Number.isFinite(data.qpos[2])) {
+      poisoned = true;
+      fell = true;
+      sum -= T.fall?.enabled ? T.fall.weight : 5;
+      break;
+    }
     if (isFallen()) {
       fell = true;
-      if (T.fall?.enabled) sum -= T.fall.weight * n;
+      if (T.fall?.enabled) sum -= T.fall.weight;
       break;
     }
   }
-  return { fitness: n > 0 ? sum / n : 0, fell, steps: n };
+  let fitness;
+  if (n <= 0) {
+    fitness = 0;
+  } else if (runCfg.fitnessMode === "sum") {
+    fitness = (sum / Math.max(1, steps)) * 100 + (n / Math.max(1, steps)) * 20;
+  } else {
+    fitness = sum / n;
+  }
+  return { fitness: Number.isFinite(fitness) ? fitness : -100, fell, steps: n };
 }
 
 self.onmessage = async (e) => {
@@ -449,7 +558,10 @@ self.onmessage = async (e) => {
     } else if (msg.type === "eval") {
       const theta = new Float32Array(msg.theta);
       pointSnapshot = msg.targetPoint ? msg.targetPoint : null;
-      const r = runRollout(theta, msg.layout, msg.reward, msg.rolloutSteps, pointSnapshot);
+      const r = runRollout(
+        theta, msg.layout, msg.reward, msg.rolloutSteps, pointSnapshot,
+        msg.runCfg, msg.cmdScale,
+      );
       post({ type: "result", jobId: msg.jobId, ...r });
     }
   } catch (err) {

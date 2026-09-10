@@ -7,7 +7,7 @@ import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import type { Telemetry } from "@/lib/md/app-core";
 import type { WorldConfig, WorldFeatures } from "@/lib/md/worldgen";
-import { Dices, Mountain } from "lucide-react";
+import { Dices, Mountain, RotateCcw } from "lucide-react";
 
 interface WorldPanelProps {
   tel: Telemetry;
@@ -113,11 +113,20 @@ export default function WorldPanel({ tel, onApply, onReroll }: WorldPanelProps) 
           >
             <Dices className="h-4 w-4" /> Neue Welt würfeln
           </Button>
+          <Button
+            onClick={() => onApply({ ...cfg, enabled: false })}
+            variant="outline"
+            className={`h-11 gap-1.5 border-slate-600 text-slate-300 hover:bg-white/5 ${cfg.enabled ? "" : "border-emerald-500/50 text-emerald-300"}`}
+            title="Zurück zur Original-Arena (keine Hindernisse)"
+          >
+            <RotateCcw className="h-4 w-4" /> Original
+          </Button>
         </div>
         <p className="text-[11px] leading-snug text-slate-500">
           Änderungen bauen die Physik neu (kurzer Ladevorgang). Der Roboter startet
           immer in der freien Zone in der Mitte. Löcher ersetzen den Boden durch
-          Fliesen – wer reinfällt, wird als Sturz gewertet.
+          Fliesen – wer reinfällt, wird als Sturz gewertet. „Original“ = die
+          unveränderte Trainings-Arena ohne Zufallshindernisse.
         </p>
       </div>
 
