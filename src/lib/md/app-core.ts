@@ -213,6 +213,8 @@ export class TrainerCore {
   private testUptime = 0;
   private testReward = 0;
   private testStepN = 0;
+  /** v2.6: Sturz-Strafe im Test-Modus nur EINMAL pro Fall abziehen. */
+  private testFallPenalized = false;
   private prevAct: Float32Array = new Float32Array(0);
   private actBuf: Float32Array = new Float32Array(0);
 
@@ -1261,12 +1263,26 @@ export class TrainerCore {
 
     if (this.mode === "test") {
       this.testStepN++;
-      const r = stepRewardValue(
-        engine, this.rewardCfg!, actUsed, this.prevAct,
-        { t: this.testUptime, step: this.testStepN, dt: this.stepMs() / 1000 },
-      );
-      // v2.6: NaN darf den kumulierten Reward nie vergiften
-      if (Number.isFinite(r)) this.testReward += r;
+      // v2.6: Ehrlicher Reward — Bodenzeit bringt NICHTS. Am Boden liegend
+      // oder während der Aufrichtung gibt es keine Punkte mehr.
+      if (!engine.isFallen() && !this.recovering) {
+        const r = stepRewardValue(
+          engine, this.rewardCfg!, actUsed, this.prevAct,
+          { t: this.testUptime, step: this.testStepN, dt: this.stepMs() / 1000 },
+        );
+        if (Number.isFinite(r)) this.testReward += r;
+      }
+      // v2.6: Sturz kostet (einmalig pro Fall) — Fälle dürfen sich NIEMALS
+      // auszahlen, sonst lernt die Evolution falsches Verhalten.
+      if (engine.isFallen()) {
+        if (!this.testFallPenalized) {
+          this.testFallPenalized = true;
+          const fw = this.rewardCfg?.terms.fall;
+          this.testReward -= Number.isFinite(fw?.weight) && fw!.weight > 0 ? fw!.weight : 10;
+        }
+      } else {
+        this.testFallPenalized = false;
+      }
       this.prevAct.set(actUsed);
     }
   }
@@ -1370,11 +1386,23 @@ export class TrainerCore {
     engine.stepWithAction(actUsed);
     if (this.mode === "test") {
       this.testStepN++;
-      const r = stepRewardValue(
-        engine, this.rewardCfg!, actUsed, this.prevAct,
-        { t: this.testUptime, step: this.testStepN, dt: this.stepMs() / 1000 },
-      );
-      if (Number.isFinite(r)) this.testReward += r;
+      // v2.6: Ehrlicher Reward (identisch zum Enten-Pfad) — Bodenzeit bringt nichts.
+      if (!engine.isFallen() && !this.recovering) {
+        const r = stepRewardValue(
+          engine, this.rewardCfg!, actUsed, this.prevAct,
+          { t: this.testUptime, step: this.testStepN, dt: this.stepMs() / 1000 },
+        );
+        if (Number.isFinite(r)) this.testReward += r;
+      }
+      if (engine.isFallen()) {
+        if (!this.testFallPenalized) {
+          this.testFallPenalized = true;
+          const fw = this.rewardCfg?.terms.fall;
+          this.testReward -= Number.isFinite(fw?.weight) && fw!.weight > 0 ? fw!.weight : 10;
+        }
+      } else {
+        this.testFallPenalized = false;
+      }
       this.prevAct.set(actUsed);
     }
   }

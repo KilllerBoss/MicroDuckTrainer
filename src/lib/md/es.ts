@@ -360,10 +360,12 @@ function ctxStep(
     ctx.fell = true;
     ctx.done = true;
     if (T.fall?.enabled) {
-      // v2.3: Summen-Modus → FLACHE Strafe (Ranking steigt stetig mit der
-      // Überlebensdauer); Mittel-Modus → ×n (pro-step-Beitrag wie bisher).
+      // v2.3: Summen-Modus → FLACHE Strafe; Mittel-Modus → ×n.
+      // v2.6: Sum-Modus kostet ZUSÄTZLICH die verlorene Restzeit (alive-Bonus
+      // der ausgefallenen Schritte) — sonst kann frühes Umfallen netto PLUS
+      // ergeben (Nutzerbefund: "fällt und bekommt Punkte").
       ctx.sum -= run.fitnessMode === "sum"
-        ? T.fall.weight
+        ? T.fall.weight + (T.alive?.enabled ? T.alive.weight * (ctx.steps - ctx.n) : 0)
         : T.fall.weight * ctx.n;
     }
     return;
@@ -376,6 +378,9 @@ function ctxStep(
     ctx.fell = true;
     ctx.done = true;
     ctx.sum -= T.fall?.enabled ? T.fall.weight : 5;
+    if (run.fitnessMode === "sum" && T.alive?.enabled) {
+      ctx.sum -= T.alive.weight * (ctx.steps - ctx.n);
+    }
     return;
   }
   ctx.sum += val;

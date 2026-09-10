@@ -590,17 +590,22 @@ function runRollout(theta, layout, reward, steps, targetPoint, run, cmdArr) {
     tImit += policyDt;
     prevAct.set(actF);
     // v2.6: NaN-Schutz (identisch zu es.ts) — divergierte Physik beendet die
-    // Runde sofort, statt REWARD NaN an die Generation weiterzureichen.
+    // Runde sofort UND kostet die verlorene Restzeit (kein Plus für Stürze!).
     if (!Number.isFinite(sum) || !Number.isFinite(data.qpos[2])) {
       fell = true;
       sum -= T.fall?.enabled ? T.fall.weight : 5;
+      if (runCfg.fitnessMode === "sum" && T.alive?.enabled) {
+        sum -= T.alive.weight * (steps - n);
+      }
       break;
     }
     if (isFallen()) {
       fell = true;
       if (T.fall?.enabled) {
-        // v2.3: Summen-Modus → flache Strafe (identisch zu es.ts)
-        sum -= runCfg.fitnessMode === "sum" ? T.fall.weight : T.fall.weight * n;
+        // v2.3: Summen-Modus → flache Strafe; v2.6: + verlorene Restzeit
+        sum -= runCfg.fitnessMode === "sum"
+          ? T.fall.weight + (T.alive?.enabled ? T.alive.weight * (steps - n) : 0)
+          : T.fall.weight * n;
       }
       break;
     }
