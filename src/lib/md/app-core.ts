@@ -23,6 +23,7 @@ import {
   buildImitClip, targetAt, rootDeltaAt, saveImitPrefs,
   type ImitClip,
 } from "./imitation";
+import { defaultRunCfg, type RunCfg } from "./es";
 
 
 export type Mode = "manuell" | "training" | "test";
@@ -549,7 +550,14 @@ export class TrainerCore {
       this.esView = null;
       this.esObsExtra = 0;
       const meta = getModel(modelId);
-      const clip = await buildImitClip(buffer, clipIndex, meta, mirror);
+      // v2.3: Center = aktuelle Ruhelage des Roboters (G1: Stand-Pose mit
+      // entspannten Armen) + Zielhöhe für Cross-Species-Skalierung.
+      const clip = await buildImitClip(
+        buffer, clipIndex, meta, mirror,
+        this.engine.standPose.length === meta.actionDim
+          ? this.engine.standPose : null,
+        meta.targetHeight,
+      );
       if (clip.mapped === 0) {
         return { ok: false, message: "Keine Gelenke gemappt – Skeleton-Namen nicht erkannt." };
       }
@@ -1118,7 +1126,8 @@ export class TrainerCore {
     }
 
     if (this.mode === "test") {
-      this.testUptime = (performance.now() - this.testStart) / 1000;
+      // v2.3: Sim-Zeit (Steps × dt) statt Wanduhr – korrekt auch bei Tempo 4×
+      this.testUptime = this.testStepN * (this.stepMs() / 1000);
     }
   }
 
@@ -1252,10 +1261,12 @@ export class TrainerCore {
 
     if (this.mode === "test") {
       this.testStepN++;
-      this.testReward += stepRewardValue(
+      const r = stepRewardValue(
         engine, this.rewardCfg!, actUsed, this.prevAct,
         { t: this.testUptime, step: this.testStepN, dt: this.stepMs() / 1000 },
       );
+      // v2.6: NaN darf den kumulierten Reward nie vergiften
+      if (Number.isFinite(r)) this.testReward += r;
       this.prevAct.set(actUsed);
     }
   }
@@ -1359,10 +1370,11 @@ export class TrainerCore {
     engine.stepWithAction(actUsed);
     if (this.mode === "test") {
       this.testStepN++;
-      this.testReward += stepRewardValue(
+      const r = stepRewardValue(
         engine, this.rewardCfg!, actUsed, this.prevAct,
         { t: this.testUptime, step: this.testStepN, dt: this.stepMs() / 1000 },
       );
+      if (Number.isFinite(r)) this.testReward += r;
       this.prevAct.set(actUsed);
     }
   }
@@ -1499,7 +1511,11 @@ export class TrainerCore {
       imitation: this.imitClip
         ? {
             name: this.imitClip.name, duration: this.imitClip.duration,
-            playing: this.imitPlaying, time: this.imitTime,
+            playing: this.imitPlaying,
+            // v2.3: Anzeigezeit wrappen (49.2/9.0 s → 4.2/9.0 s)
+            time: this.imitClip.duration > 0
+              ? this.imitTime % this.imitClip.duration
+              : this.imitTime,
             mapped: this.imitClip.mapped, manual: this.imitManual,
           }
         : null,

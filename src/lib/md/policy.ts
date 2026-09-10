@@ -130,6 +130,16 @@ export class MlpPolicy {
     return t;
   }
 
+  /** v2.3: Start-Policy "still stehen" – Output-Layer auf 0, Hidden klein zufällig.
+   *  Aktionen starten bei 0 → Roboter hält die Stand-Pose, ES erkundet per Sigma.
+   *  Der kritischste Profi-Trick fürs Training ab Null (kein Zappeln/Stürzen!). */
+  static standingTheta(o: number, h: number, a: number, scale = 0.15): Float32Array {
+    const n = MlpPolicy.thetaSize(o, h, a);
+    const t = new Float32Array(n); // w2/b2 (Output) bleiben 0
+    for (let i = 0; i < h * o + h; i++) t[i] = (Math.random() * 2 - 1) * scale;
+    return t;
+  }
+
   forward(obs: Float32Array, out?: Float32Array): Float32Array {
     const L = this.slices.length;
     let src = obs;
@@ -379,7 +389,9 @@ export async function warmStartMlp(meta: ModelMeta, extra = 0): Promise<{
   // Zufalls-Init: kleiner Scale (G1) → weniger Verkrampfung am Start
   const scale = meta.id === "microduck" ? 0.3 : 0.12;
   return {
-    theta: MlpPolicy.randomTheta(o, 32, meta.actionDim, scale),
+    // v2.3: G1 & Co ohne ONNX starten mit "stiller" Policy (steht zuerst,
+    // lernt dann zu gehen) statt randomTheta → kein sofortiges Zappeln/Stürzen.
+    theta: MlpPolicy.standingTheta(o, 32, meta.actionDim, scale),
     layout: { obsDim: o, hidden: 32, actionDim: meta.actionDim },
     warm: false,
   };

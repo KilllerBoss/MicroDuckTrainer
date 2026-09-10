@@ -47,6 +47,19 @@ export interface GeminiPatch {
   turbo?: number; // 1 | 4 | 16 | 32 | 64
   resetFirst?: boolean; // Training von Null starten (z. B. bei neuem Bewegungsziel)
   explanation?: string;
+  // ── v2.3: Profi-Tricks (von Gemini steuerbar) ──
+  runCfg?: {
+    cmdTrain?: boolean;
+    cmdFwd?: number;
+    cmdLat?: number;
+    cmdAng?: number;
+    curriculum?: boolean;
+    actionSmooth?: number;
+    pushes?: boolean;
+    noiseReset?: boolean;
+    fitnessMode?: "sum" | "mean";
+    weightDecay?: number;
+  };
   // ── v2.2: Code-Experte ──
   /** Reward-Code (JS-Funktionskörper, `return` einer Zahl). */
   code?: string;
@@ -149,6 +162,7 @@ Wähle Gewichte konservativ, aber wirksam; deaktiviere Terme, die dem Ziel wider
 Wenn das Ziel Bewegung über Zeit braucht (Springen, Tanzen, Aufstehen) und keine Imitation aktiv ist, erkläre es und setze trotzdem sinnvolle Terme.
 Wenn Welt/Punkt-Modus helfen (z. B. Treppen → Welt mit Treppen, Ziel verfolgen → point.mode "frei" oder "pfad" + Reward-Term "pointChase"), setze sie.
 turbo: 1=stabil, 16=schnell, 64=maximal (nur bei einfachen Zielen hoch setzen). resetFirst=true bei grundlegend neuem Bewegungsmuster.
+PROFI-TRICKS (runCfg, optional): cmdTrain (bool, Zufalls-Tempo je Runde → Joystick-Fähigkeit), cmdFwd/cmdLat/cmdAng (Ziel-Tempo m/s bzw. rad/s), curriculum (bool, Tempo bei Stürzen automatisch reduzieren), actionSmooth (0.3=sehr glatt .. 1=aus; gegen Zittern), pushes (bool, Zufalls-Stöße für Robustheit), noiseReset (bool, varied Starts), fitnessMode ("sum"=Überleben zählt, empfohlen), weightDecay (0..0.05).
 
 Antworte AUSSCHLIESSLICH mit JSON (kein Markdown) nach diesem Schema:
 {"reward":{"<termId>":{"enabled":bool,"weight":number,"param":number}},"point":{"mode":"frei","radius":1.5,"speedByDist":true,"maxSpeed":0.25,"fullDist":1.5},"world":{"enabled":bool,"difficulty":number,"density":number,"features":{"treppen":bool,"huegel":bool,"loecher":bool,"hindernisse":bool,"stange":bool}},"turbo":1,"resetFirst":bool,"training":{"cmdTrain":true,"cmdFwd":0.25,"curriculum":true,"actionSmooth":0.6,"pushes":true,"noiseReset":true,"fitnessMode":"sum","weightDecay":0.02},"explanation":"max. 4 Sätze, Deutsch, warum diese Regeln zum Ziel führen"}`;
@@ -324,6 +338,23 @@ export function parsePatch(text: string): GeminiPatch {
   }
   if ([1, 4, 16, 32, 64].includes(obj.turbo)) patch.turbo = obj.turbo;
   if (typeof obj.resetFirst === "boolean") patch.resetFirst = obj.resetFirst;
+  // ── v2.3: Profi-Tricks ──
+  if (obj.runCfg && typeof obj.runCfg === "object") {
+    const r: NonNullable<GeminiPatch["runCfg"]> = {};
+    if (typeof obj.runCfg.cmdTrain === "boolean") r.cmdTrain = obj.runCfg.cmdTrain;
+    if (Number.isFinite(obj.runCfg.cmdFwd)) r.cmdFwd = clampNum(obj.runCfg.cmdFwd, 0.05, 1.2);
+    if (Number.isFinite(obj.runCfg.cmdLat)) r.cmdLat = clampNum(obj.runCfg.cmdLat, 0, 0.6);
+    if (Number.isFinite(obj.runCfg.cmdAng)) r.cmdAng = clampNum(obj.runCfg.cmdAng, 0, 2);
+    if (typeof obj.runCfg.curriculum === "boolean") r.curriculum = obj.runCfg.curriculum;
+    if (Number.isFinite(obj.runCfg.actionSmooth)) r.actionSmooth = clampNum(obj.runCfg.actionSmooth, 0.3, 1);
+    if (typeof obj.runCfg.pushes === "boolean") r.pushes = obj.runCfg.pushes;
+    if (typeof obj.runCfg.noiseReset === "boolean") r.noiseReset = obj.runCfg.noiseReset;
+    if (obj.runCfg.fitnessMode === "sum" || obj.runCfg.fitnessMode === "mean") {
+      r.fitnessMode = obj.runCfg.fitnessMode;
+    }
+    if (Number.isFinite(obj.runCfg.weightDecay)) r.weightDecay = clampNum(obj.runCfg.weightDecay, 0, 0.05);
+    if (Object.keys(r).length) patch.runCfg = r;
+  }
   if (typeof obj.explanation === "string") patch.explanation = obj.explanation;
   // ── v2.2: Code-Experte ──
   if (typeof obj.code === "string" && obj.code.trim()) {

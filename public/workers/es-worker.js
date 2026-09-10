@@ -15,6 +15,43 @@ let imitBuf = null;
 let policyDt = 0.02;
 let pointSnapshot = null; // [x, y] | null (Punkt-Modus, Snapshot je Eval)
 
+// ── v2.3: Profi-Tricks (identisch zu src/lib/md/es.ts) ──
+function defaultRunCfg() {
+  return {
+    cmdTrain: true, cmdFwd: 0.3, cmdLat: 0.15, cmdAng: 0.8,
+    curriculum: true, actionSmooth: 0.6, pushes: true, noiseReset: true,
+    fitnessMode: "sum", weightDecay: 0.005,
+  };
+}
+function sanitizeRunCfg(p) {
+  const d = defaultRunCfg();
+  if (!p || typeof p !== "object") return d;
+  const num = (v, def, lo, hi) =>
+    typeof v === "number" && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : def;
+  return {
+    cmdTrain: typeof p.cmdTrain === "boolean" ? p.cmdTrain : d.cmdTrain,
+    cmdFwd: num(p.cmdFwd, d.cmdFwd, 0, 1.2),
+    cmdLat: num(p.cmdLat, d.cmdLat, 0, 0.6),
+    cmdAng: num(p.cmdAng, d.cmdAng, 0, 2),
+    curriculum: typeof p.curriculum === "boolean" ? p.curriculum : d.curriculum,
+    actionSmooth: num(p.actionSmooth, d.actionSmooth, 0.2, 1),
+    pushes: typeof p.pushes === "boolean" ? p.pushes : d.pushes,
+    noiseReset: typeof p.noiseReset === "boolean" ? p.noiseReset : d.noiseReset,
+    fitnessMode: p.fitnessMode === "mean" ? "mean" : "sum",
+    weightDecay: num(p.weightDecay, d.weightDecay, 0, 0.05),
+  };
+}
+function drawCmd(cfg, cmdScale, out) {
+  if (cfg.cmdTrain) {
+    out[0] = Math.random() * cfg.cmdFwd * cmdScale;
+    if (out.length > 1) out[1] = (Math.random() * 2 - 1) * cfg.cmdLat * cmdScale;
+    if (out.length > 2) out[2] = (Math.random() * 2 - 1) * cfg.cmdAng * cmdScale;
+  } else {
+    out.fill(0);
+    out[0] = 0.25 * cmdScale;
+  }
+}
+
 // ── v2.2: KI-Code-Term (identisch zu src/lib/md/customcode.ts) ──
 const FORBIDDEN = /\b(import|require|eval|Function|fetch|XMLHttpRequest|localStorage|sessionStorage|indexedDB|document|window|globalThis|self|postMessage|Worker|WebSocket)\b/;
 let customCacheKey = null;
@@ -162,7 +199,22 @@ async function boot(payload) {
 
 function resetToKeyframe() {
   mujoco.mj_resetDataKeyframe(model, data, keyId);
-  mujoco.mj_forward(model, data);
+  // v2.3: G1-Arme natürlicher (Ellbogen ~26° statt 90°) – identisch zur Engine
+  if (ctx.modelId === "unitree_g1") {
+    const relax = {
+      left_shoulder_pitch_joint: 0.35, right_shoulder_pitch_joint: 0.35,
+      left_shoulder_roll_joint: 0.1, right_shoulder_roll_joint: -0.1,
+      left_elbow_joint: 0.45, right_elbow_joint: 0.45,
+    };
+    const qpos = data.qpos;
+    for (let j = 0; j < ctx.jointNames.length; j++) {
+      const r = relax[ctx.jointNames[j]];
+      if (r !== undefined) qpos[addrs.qposAdr[j]] = r;
+    }
+    mujoco.mj_forward(model, data);
+  } else {
+    mujoco.mj_forward(model, data);
+  }
   const qpos = data.qpos;
   standPose = new Float32Array(ctx.actionDim);
   for (let j = 0; j < ctx.actionDim; j++) standPose[j] = qpos[addrs.qposAdr[j]];
@@ -537,6 +589,13 @@ function runRollout(theta, layout, reward, steps, targetPoint, run, cmdArr) {
     sum += val;
     tImit += policyDt;
     prevAct.set(actF);
+    // v2.6: NaN-Schutz (identisch zu es.ts) — divergierte Physik beendet die
+    // Runde sofort, statt REWARD NaN an die Generation weiterzureichen.
+    if (!Number.isFinite(sum) || !Number.isFinite(data.qpos[2])) {
+      fell = true;
+      sum -= T.fall?.enabled ? T.fall.weight : 5;
+      break;
+    }
     if (isFallen()) {
       fell = true;
       if (T.fall?.enabled) {
@@ -547,7 +606,8 @@ function runRollout(theta, layout, reward, steps, targetPoint, run, cmdArr) {
     }
   }
   // v2.3: Fitness-Modus – Summe (Überleben zählt) oder Mittelwert (klassisch)
-  return { fitness: runCfg.fitnessMode === "sum" ? sum : (n > 0 ? sum / n : 0), fell, steps: n };
+  const fitness = runCfg.fitnessMode === "sum" ? sum : (n > 0 ? sum / n : 0);
+  return { fitness: Number.isFinite(fitness) ? fitness : -100, fell, steps: n };
 }
 
 self.onmessage = async (e) => {

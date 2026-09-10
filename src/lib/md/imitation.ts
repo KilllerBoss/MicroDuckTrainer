@@ -31,9 +31,13 @@ export interface ImitClip {
   fps: number; // Samplerate der Zielpose (30 Hz)
   frames: number;
   dim: number; // actionDim
-  targets: Float32Array; // frames × dim (Zeilen = Frames)
+  targets: Float32Array; // frames × dim – v2.3: RELATIV zur Roboter-Ruhelage
+  /** v2.3: Ruhelage (Gelenkwinkel) des Ziel-Roboters – absolut = rel + center. */
+  center: Float32Array;
   rootY: Float32Array; // frames – Wurzel-Höhe (GLB y-up, Meter)
   baseY: number;
+  /** v2.3: Roboterhöhe / Clip-Wurzelhöhe – skaliert Root-Delta cross-species. */
+  scaleY: number;
   mapped: number; // Anzahl gemappter Gelenke
   mapping: { joint: string; bone: string }[];
 }
@@ -146,12 +150,18 @@ export async function listGlbAnimations(buffer: ArrayBuffer): Promise<ClipInfo[]
 /**
  * Sampelt einen Clip zu Gelenk-Zielwinkeln. mirror = links/rechts tauschen.
  * Euler-Extraktion: rel = q(t) · q_rest⁻¹ (XYZ-Order), Komponente axis · sign.
+ * v2.3: Ziele werden RELATIV zur Roboter-Ruhelage gespeichert (`center`) und
+ * das Root-Höhen-Delta mit scaleY skaliert – so kann z. B. die Ente aus
+ * Human-Animationen lernen (Cross-Species), ohne von absurden Absolutwinkeln
+ * zerlegt zu werden. center: Roboter-Ruhelage (z. B. engine.standPose).
  */
 export async function buildImitClip(
   buffer: ArrayBuffer,
   clipIndex: number,
   meta: ModelMeta,
   mirror: boolean,
+  center?: Float32Array | number[] | null,
+  robotHeight?: number,
 ): Promise<ImitClip> {
   const gltf = await new GLTFLoader().parseAsync(buffer, "");
   const clip = gltf.animations[clipIndex];
@@ -205,6 +215,9 @@ export async function buildImitClip(
   }
 
   const targets = new Float32Array(frames * dim);
+  const centerArr = center && center.length === dim
+    ? Float32Array.from(center)
+    : new Float32Array(meta.defaultPose);
   const rootTrack = clip.tracks.find(
     (t) => /hips|pelvis|root/i.test(t.name) && t.name.endsWith(".position"),
   ) as unknown as THREE.VectorKeyframeTrack | undefined;
@@ -220,17 +233,35 @@ export async function buildImitClip(
     const t = Math.min(clip.duration, f / fps);
     if (rootInterp) {
       const v = (rootInterp as any).evaluate(t);
-      rootY[f] = v[1]; // GLB y-up
+      rootY[f] = Number.isFinite(v[1]) ? v[1] : 0; // GLB y-up
       if (f === 0) baseY = rootY[0];
     }
     for (const e of entries) {
       const v = (e.track as any).createInterpolant().evaluate(t);
-      tmp.set(v[0], v[1], v[2], v[3]);
+      // v2.3: Quaternionen normalisieren (Zero-Längen-Keys in manchen GLBs
+      // erzeugen sonst NaN beim Slerp → REWARD-NaN!).
+      const qlen = Math.hypot(v[0], v[1], v[2], v[3]);
+      if (!Number.isFinite(qlen) || qlen < 1e-8) continue; // Kaputter Key → Ruhelage
+      tmp.set(v[0] / qlen, v[1] / qlen, v[2] / qlen, v[3] / qlen);
       rel.copy(tmp).multiply(_rest.copy(e.rest).invert());
       eul.setFromQuaternion(rel, "XYZ");
       const comp = e.axis === 0 ? eul.x : e.axis === 1 ? eul.y : eul.z;
+      if (!Number.isFinite(comp)) continue;
+      // v2.3: RELATIV zur Ruhelage speichern (robust cross-species)
       targets[f * dim + e.jointIdx] = e.sign * comp;
     }
+  }
+
+  // v2.3: Höhen-Skalierung Roboter ↔ Clip (Ente 0.12 m, G1 0.72 m …)
+  const targetH = Number.isFinite(robotHeight) && robotHeight! > 0.02
+    ? robotHeight! : meta.targetHeight;
+  const scaleY = baseY > 0.05 ? Math.min(3, Math.max(0.2, targetH / baseY)) : 1;
+  // NaN-Sweep: nie nicht-finite Werte rausgeben
+  for (let i = 0; i < targets.length; i++) {
+    if (!Number.isFinite(targets[i])) targets[i] = 0;
+  }
+  for (let i = 0; i < rootY.length; i++) {
+    if (!Number.isFinite(rootY[i])) rootY[i] = baseY;
   }
 
   return {
@@ -240,35 +271,41 @@ export async function buildImitClip(
     frames,
     dim,
     targets,
+    center: centerArr,
     rootY,
     baseY,
+    scaleY,
     mapped: entries.length,
     mapping,
   };
 }
 
-/** Ziel-Gelenkwinkel zum Zeitpunkt t (loop) in `out` schreiben. */
+/** Ziel-Gelenkwinkel (ABSOLUT = rel + Ruhelage) zum Zeitpunkt t (loop). */
 export function targetAt(clip: ImitClip, t: number, out: Float32Array): void {
   const tt = clip.duration > 0 ? ((t % clip.duration) + clip.duration) % clip.duration : 0;
   const x = tt * clip.fps;
   const f0 = Math.min(clip.frames - 1, Math.floor(x));
   const f1 = Math.min(clip.frames - 1, f0 + 1);
   const u = x - f0;
+  const c = clip.center;
   for (let j = 0; j < clip.dim; j++) {
     const a = clip.targets[f0 * clip.dim + j];
     const b = clip.targets[f1 * clip.dim + j];
-    out[j] = a + (b - a) * u;
+    let v = a + (b - a) * u;
+    if (c && j < c.length) v += c[j];
+    out[j] = Number.isFinite(v) ? v : (c && j < c.length ? c[j] : 0);
   }
 }
 
-/** Wurzel-Höhen-Delta zum Zeitpunkt t (loop, relativ zum Clip-Start). */
+/** Wurzel-Höhen-Delta zum Zeitpunkt t (loop, relativ zum Clip-Start, skaliert). */
 export function rootDeltaAt(clip: ImitClip, t: number): number {
   const tt = clip.duration > 0 ? ((t % clip.duration) + clip.duration) % clip.duration : 0;
   const x = tt * clip.fps;
   const f0 = Math.min(clip.frames - 1, Math.floor(x));
   const f1 = Math.min(clip.frames - 1, f0 + 1);
   const u = x - f0;
-  return (clip.rootY[f0] + (clip.rootY[f1] - clip.rootY[f0]) * u) - clip.baseY;
+  const raw = (clip.rootY[f0] + (clip.rootY[f1] - clip.rootY[f0]) * u) - clip.baseY;
+  return Number.isFinite(raw) ? raw * (clip.scaleY || 1) : 0;
 }
 
 /** Persistenz der letzten Auswahl (Index + Mirror) – GLB selbst bleibt Session-Daten. */

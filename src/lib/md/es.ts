@@ -40,10 +40,13 @@ export function imitSampleAt(d: ImitEvalData, t: number, out: Float32Array): num
   for (let j = 0; j < d.dim; j++) {
     const a = d.targets[f0 * d.dim + j];
     const b = d.targets[f1 * d.dim + j];
-    out[j] = (a + (b - a) * u) + (c ? c[j] : 0);
+    let v = (a + (b - a) * u) + (c ? c[j] : 0);
+    // v2.6 NaN-Schutz: kaputte Clip-Werte → Ruhelage (statt REWARD NaN)
+    out[j] = Number.isFinite(v) ? v : (c ? c[j] : 0);
   }
   const raw = (d.rootY[f0] + (d.rootY[f1] - d.rootY[f0]) * u) - d.baseY;
-  return raw * (d.scaleY ?? 1);
+  const s = d.scaleY ?? 1;
+  return Number.isFinite(raw) ? raw * s : 0;
 }
 
 /**
@@ -109,6 +112,9 @@ export interface EsStats {
 const BASE_SIGMA = 0.08;
 const LR = 0.03;
 const STAGNATION_GENS = 8;
+/** v2.3: Curriculum-Schwellen (Sturzrate → Tempo-Skalierung). */
+const CURRICULUM_UP = 0.08; // unter 8 % Stürze → Tempo hoch
+const CURRICULUM_DOWN = 0.45; // über 45 % Stürze → Tempo runter
 
 /** v2.3: Layer-Dimensionen eines Layouts ([obs, ...hidden, action]). */
 export function layerDims(layout: MlpLayout): number[] {
@@ -347,11 +353,9 @@ function ctxStep(
     engine.applyPush();
   }
 
-  ctx.sum += stepRewardValue(
-    engine, cfg, ctx.actF, ctx.prevAct, { t: ctx.t, step: ctx.n, dt: policyDt },
-  );
-  ctx.prevAct.set(ctx.actF);
-
+  // v2.6: ERST Sturz prüfen, DANN Reward — und NIE NaN in sum_addieren.
+  // Genau das verursachte "REWARD NaN": divergierte Physik (qpos=NaN) lieferte
+  // NaN-Rewards, vergiftete sum und damit die komplette Generation.
   if (engine.isFallen()) {
     ctx.fell = true;
     ctx.done = true;
@@ -362,7 +366,22 @@ function ctxStep(
         ? T.fall.weight
         : T.fall.weight * ctx.n;
     }
-  } else if (ctx.n >= ctx.steps) {
+    return;
+  }
+  const val = stepRewardValue(
+    engine, cfg, ctx.actF, ctx.prevAct, { t: ctx.t, step: ctx.n, dt: policyDt },
+  );
+  if (!Number.isFinite(val)) {
+    // Physik divergiert (NaN/Inf) → Runde sofort als gescheitert werten
+    ctx.fell = true;
+    ctx.done = true;
+    ctx.sum -= T.fall?.enabled ? T.fall.weight : 5;
+    return;
+  }
+  ctx.sum += val;
+  ctx.prevAct.set(ctx.actF);
+
+  if (ctx.n >= ctx.steps) {
     ctx.done = true;
   }
 }
@@ -370,7 +389,9 @@ function ctxStep(
 function finishCtx(ctx: RolloutCtx, mode: "sum" | "mean"): number {
   // v2.3: Summen-Modus (Profi-Trick): länger überleben = mehr Reward-Akkumulation
   // → natürlicher Überlebensdruck; Mittelwert macht Sturzzeitpunkt egal.
-  return mode === "sum" ? ctx.sum : (ctx.n > 0 ? ctx.sum / ctx.n : 0);
+  // v2.6: NaN-Schutz — vergiftete Runden zählen als Totalausfall.
+  const f = mode === "sum" ? ctx.sum : (ctx.n > 0 ? ctx.sum / ctx.n : 0);
+  return Number.isFinite(f) ? f : -100;
 }
 
 // ── EsTrainer ────────────────────────────────────────────────────────────────
@@ -576,7 +597,11 @@ export class EsTrainer {
       await Promise.all(
         members.map(async (m, i) => {
           const r = await this.evalViaWorker(m, cmds[i]);
-          results[i] = r;
+          // v2.6: NaN-Schutz — Worker-Ergebnisse sind immer endlich.
+          results[i] = {
+            ...r,
+            fitness: Number.isFinite(r.fitness) ? r.fitness : -100,
+          };
         }),
       );
     } else {
@@ -747,9 +772,17 @@ export class EsTrainer {
       this.theta[j] = this.theta[j] * (1 - this.lr * wd) + grad[j] * norm;
     }
 
+    // v2.3: Weight-Decay – hält Theta klein (tanh bleibt sensitiv, kein Drift)
+    if (this.runCfg.weightDecay > 0) {
+      const wd = this.runCfg.weightDecay;
+      for (let j = 0; j < this.theta.length; j++) this.theta[j] *= 1 - wd;
+    }
+
     const bestIdx = order[n - 1];
     const bestFit = results[bestIdx].fitness;
-    const meanFit = results.reduce((s, r) => s + r.fitness, 0) / n;
+    let meanFit = 0;
+    for (const r of results) meanFit += Number.isFinite(r.fitness) ? r.fitness : 0;
+    meanFit /= n;
     this.generation++;
     this.lastGenBest = bestFit;
     this.lastGenMean = meanFit;
