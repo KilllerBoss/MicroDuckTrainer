@@ -80,12 +80,21 @@ export default function TrainingPanel(props: TrainingPanelProps) {
                   ? "bg-cyan-500/25 text-cyan-200"
                   : "text-slate-400 hover:bg-white/5"
               } ${t === 64 ? "font-bold" : ""}`}
-              title={t === 64 ? "Hyper-Modus (96 Individuen)" : `${t}× Turbo`}
+              title={t === 64 ? "Hyper-Modus (96 Individuen) + 6× Vorschau-Tempo" : `${t}× Turbo – Training UND sichtbare Physik laufen ${Math.min(6, t)}× schneller`}
             >
               {t === 64 ? "Hyper" : `${t}×`}
             </button>
           ))}
         </div>
+        {/* v2.5: Tempo-Sync-Anzeige – Vorschau läuft mit dem Trainings-Tempo */}
+        {tel.training && tel.trainPreview && (
+          <span
+            className="ml-auto rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 font-mono text-[11px] text-emerald-300"
+            title="Die sichtbare Simulation läuft synchron mit dem Trainings-Tempo (max. 6×)"
+          >
+            ⏩ Welt: {Math.min(6, turbo)}× sync
+          </span>
+        )}
       </div>
 
       {/* v2.4: Live-Vorschau – der Roboter zeigt das Training sichtbar */}
@@ -95,9 +104,16 @@ export default function TrainingPanel(props: TrainingPanelProps) {
           <p className="mt-0.5 text-[10px] leading-snug text-slate-500">
             Der Roboter übt sichtbar mit und wird von Generation zu Generation
             besser. Aus = Training läuft unsichtbar im Hintergrund.
+            {" "}v2.5: Turbo beschleunigt auch die sichtbare Physik — Training und
+            Welt laufen immer synchron (max. 6×, schwache Geräte regeln selbst zurück).
           </p>
         </div>
-        <Switch checked={tel.trainPreview} onCheckedChange={onTrainPreview} />
+        <div className="flex flex-col items-end gap-1">
+          <Switch checked={tel.trainPreview} onCheckedChange={onTrainPreview} />
+          {tel.training && tel.trainPreview && tel.previewSpeed > 1 && (
+            <span className="font-mono text-[10px] text-emerald-400">{tel.previewSpeed}× Tempo</span>
+          )}
+        </div>
       </div>
 
       {/* Status */}
@@ -262,8 +278,9 @@ export default function TrainingPanel(props: TrainingPanelProps) {
               onValueChange={(v) => onTrainCfg({ cmdFwd: v[0] })}
             />
             <p className="mt-0.5 text-[10px] text-slate-600">
-              Ente läuft natürlich ~0,25 m/s, Mensch ~0,5 m/s. Trainierte Policies
-              folgen danach auch dem Joystick im Test.
+              Ente läuft natürlich ~0,25 m/s, Mensch ~0,5 m/s. Wichtig: Die Ente
+              fährt erst ab ~0,24 m/s an – darunter steht sie nur. Trainierte
+              Policies folgen danach auch dem Joystick im Test.
             </p>
           </div>
         )}

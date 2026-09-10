@@ -116,6 +116,7 @@ export interface Telemetry {
   // ── v2.1/2.2 ──
   trainCfg: TrainCfg;
   trainPreview: boolean; // v2.4: Live-Vorschau an/aus
+  previewSpeed: number; // v2.5: effektives Vorschau-Tempo (Turbo-Sync)
   customCode: { name: string; enabled: boolean } | null;
   world: WorldConfig;
   pointMode: boolean; // abgeleitet: mode !== "aus"
@@ -183,6 +184,14 @@ export class TrainerCore {
   private trainPreview = true;
   private previewCmd: [number, number, number] = [0.15, 0, 0];
   private previewCmdT = 0;
+  // v2.5: Trainings-Tempo ↔ Physik-SYNC. Der Turbo-Faktor beschleunigt nicht
+  // nur die (headlessen) Rollouts, sondern auch die SICHTBARE Simulation:
+  // Mehr Sim-Steps pro Frame bei gleichem dt → Roboter+Welt laufen sichtbar
+  // schneller mit, genau so schnell wie das Training selbst.
+  private turbo: TurboLevel = 1;
+  private previewSpeed = 1;   // effektiv aktive Vorschau-Tempo-Stufe (adaptiv)
+  private lastIterMs = 20;    // Dauer der letzten Loop-Iteration (Adaption)
+  private esActSm: Float32Array | null = null; // Aktions-Glättung wie im Training
   /** v2.3: Wie lange der Joystick schon losgelassen ist (s) – Punkt fährt heim. */
   private joyIdle = 0;
   private esObsExtra = 0; // Obs-Extra der aktuellen esView
@@ -639,6 +648,7 @@ export class TrainerCore {
     this.engine.resetToKeyframe();
     if (this.modelId === "unitree_g1") this.g1Base = new Float32Array(this.engine.standPose);
     this.prevAct.fill(0);
+    this.esActSm?.fill(0); // v2.5
     this.emit();
   }
 
@@ -729,6 +739,7 @@ export class TrainerCore {
   }
 
   setTurbo(t: TurboLevel) {
+    this.turbo = t; // v2.5: Turbo skaliert auch die sichtbare Physik (Sync)
     this.trainer?.setTurbo(t);
     this.emit();
   }
@@ -933,19 +944,39 @@ export class TrainerCore {
     let count = 0;
     let hzT0 = next;
     while (this.running) {
-      try {
-        await this.controlStep();
-      } catch (err) {
-        console.warn("[core] controlStep:", err);
+      const t0 = performance.now();
+      // v2.5: Tempo-Sync — während des Trainings läuft die sichtbare Welt mit
+      // dem Turbo-Faktor (cap 6×, damit die Darstellung lesbar bleibt). Adaptiv:
+      // Schafft das Gerät die Stufe nicht (Iteration > 1,35× Budget), wird eine
+      // Stufe abgebaut; Trainingsstopp/aus = sofort 1×.
+      const target = this.trainPreview && this.trainingActive && this.mode === "test"
+        ? Math.min(6, this.turbo)
+        : 1;
+      const stepBudget = this.stepMs();
+      if (this.previewSpeed > target) {
+        this.previewSpeed = target; // Training gestoppt/aus → sofort 1×
+      } else if (this.lastIterMs > stepBudget * 1.35 && this.previewSpeed > 1) {
+        this.previewSpeed--; // zu langsam für diese Stufe → abbauen
+      } else if (this.lastIterMs <= stepBudget * 0.5 && this.previewSpeed < target) {
+        this.previewSpeed++; // Luft da → synchron hochdrehen
       }
-      count++;
+      const n = Math.max(1, this.previewSpeed);
+      for (let k = 0; k < n && this.running; k++) {
+        try {
+          await this.controlStep();
+        } catch (err) {
+          console.warn("[core] controlStep:", err);
+        }
+      }
+      count += n; // ctrlHz = Sim-Steps je Wandsekunde (zeigt den Sync-Faktor)
+      this.lastIterMs = performance.now() - t0;
       const now = performance.now();
       if (now - hzT0 > 500) {
         this.ctrlHz = (count * 1000) / (now - hzT0);
         count = 0;
         hzT0 = now;
       }
-      next += this.stepMs();
+      next += stepBudget;
       const wait = next - performance.now();
       if (wait > 0) await new Promise((r) => setTimeout(r, wait));
       else next = performance.now(); // zurückgefallen: nicht spiralen
@@ -966,10 +997,15 @@ export class TrainerCore {
       if (this.previewCmdT <= 0) {
         this.previewCmdT = 2.5 + Math.random() * 2.5;
         const cap = Math.max(0.1, this.trainCfg.cmdFwd);
-        // 90 % vorwärts (der Warm-Start-Läufer ist für Vorwärts validiert),
-        // sanftes Gieren – die Vorschau soll Laufen zeigen, nicht Stürze.
-        const fwd = Math.random() < 0.9 ? 0.5 + Math.random() * 0.5 : -0.25 * Math.random();
-        this.previewCmd = [cap * fwd, 0, (Math.random() * 2 - 1) * 0.25];
+        // v2.5: Vorschau IMMER vorwärts ÜBER der Anfahr-Schwelle (Ente läuft
+        // erst ab ~0.24 m/s, darunter steht sie – Node-Sim gemessen). Der
+        // frühere Rückwärts-/Mini-Tempo-Zufall war der „fällt auf die Fresse /
+        // bewegt sich nicht"-Effekt. Stürze der Exploration gehören ins
+        // headless-Training – nicht in die sichtbare Show.
+        this.previewCmd = [
+          Math.max(0.24, cap * (0.55 + Math.random() * 0.35)), 0,
+          (Math.random() * 2 - 1) * 0.2,
+        ];
       }
     }
     const pm = this.pointCfg.mode;
@@ -1170,6 +1206,7 @@ export class TrainerCore {
       if (now - hold.t0 > hold.blendMs + hold.holdMs) {
         this.duckPoseHold = null;
         engine.lastAction.fill(0);
+        this.esActSm?.fill(0); // v2.5
       }
       return;
     }
@@ -1197,16 +1234,29 @@ export class TrainerCore {
       : await policy.forward(obs);
     this.actBuf.fill(0);
     this.actBuf.set(act.subarray(0, Math.min(act.length, this.actBuf.length)));
-    engine.lastAction.set(this.actBuf);
-    engine.stepWithAction(this.actBuf);
+    // v2.5: Aktions-Glättung im sichtbaren Pfad EXAKT wie im Training (ctxStep):
+    // gefilterte Aktion steuert Physik UND Obs → Vorschau/Test zeigen das
+    // trainierte Verhalten (kein Zittern, kein Sturz nur wegen Filter-Delta).
+    let actUsed = this.actBuf;
+    if (policy instanceof MlpPolicy && this.trainCfg.actionSmooth < 0.999) {
+      const a = this.trainCfg.actionSmooth;
+      if (!this.esActSm || this.esActSm.length !== this.actBuf.length) {
+        this.esActSm = new Float32Array(this.actBuf.length);
+      }
+      const sm = this.esActSm;
+      for (let j = 0; j < sm.length; j++) sm[j] = a * this.actBuf[j] + (1 - a) * sm[j];
+      actUsed = sm;
+    }
+    engine.lastAction.set(actUsed);
+    engine.stepWithAction(actUsed);
 
     if (this.mode === "test") {
       this.testStepN++;
       this.testReward += stepRewardValue(
-        engine, this.rewardCfg!, this.actBuf, this.prevAct,
+        engine, this.rewardCfg!, actUsed, this.prevAct,
         { t: this.testUptime, step: this.testStepN, dt: this.stepMs() / 1000 },
       );
-      this.prevAct.set(this.actBuf);
+      this.prevAct.set(actUsed);
     }
   }
 
@@ -1294,15 +1344,26 @@ export class TrainerCore {
     }
     const obs = engine.obsFor(this.esObsExtra >= 2);
     const act = mlp.forward(obs, this.actBuf);
-    engine.lastAction.set(act);
-    engine.stepWithAction(act);
+    // v2.5: Glättung wie im Training (sonst zittert G1 in der Vorschau)
+    let actUsed: Float32Array = act;
+    if (this.trainCfg.actionSmooth < 0.999) {
+      const a = this.trainCfg.actionSmooth;
+      if (!this.esActSm || this.esActSm.length !== act.length) {
+        this.esActSm = new Float32Array(act.length);
+      }
+      const sm = this.esActSm;
+      for (let j = 0; j < sm.length; j++) sm[j] = a * act[j] + (1 - a) * sm[j];
+      actUsed = sm;
+    }
+    engine.lastAction.set(actUsed);
+    engine.stepWithAction(actUsed);
     if (this.mode === "test") {
       this.testStepN++;
       this.testReward += stepRewardValue(
-        engine, this.rewardCfg!, act, this.prevAct,
+        engine, this.rewardCfg!, actUsed, this.prevAct,
         { t: this.testUptime, step: this.testStepN, dt: this.stepMs() / 1000 },
       );
-      this.prevAct.set(act);
+      this.prevAct.set(actUsed);
     }
   }
 
@@ -1323,6 +1384,7 @@ export class TrainerCore {
     this.recoveryUpright = 0;
     this.fallDebounce = 0;
     this.engine.lastAction.fill(0);
+    this.esActSm?.fill(0); // v2.5: Filter-State auch zuruecksetzen
     this.emit();
   }
 
@@ -1340,7 +1402,9 @@ export class TrainerCore {
       this.fallDebounce = 0;
       engine.resetToKeyframe();
       engine.lastAction.fill(0);
+      this.esActSm?.fill(0); // v2.5
       this.prevAct.fill(0);
+      this.previewCmdT = 0; // v2.5: sofort frischen (sicheren) Vorschau-Befehl
       this.emit();
       return;
     }
@@ -1362,6 +1426,7 @@ export class TrainerCore {
       this.recovering = false;
       this.recoveryUpright = 0;
       engine.lastAction.fill(0);
+      this.esActSm?.fill(0); // v2.5
       this.prevAct.fill(0);
       this.emit();
     }
@@ -1423,6 +1488,7 @@ export class TrainerCore {
       reward: this.rewardCfg ?? (this.modelId ? loadRewardConfig(this.modelId) : ({} as RewardConfig)),
       trainCfg: { ...this.trainCfg },
       trainPreview: this.trainPreview,
+      previewSpeed: this.previewSpeed, // v2.5: Sync-Faktor der sichtbaren Physik
       customCode: this.rewardCfg?.custom
         ? { name: this.rewardCfg.custom.name, enabled: this.rewardCfg.custom.enabled }
         : null,

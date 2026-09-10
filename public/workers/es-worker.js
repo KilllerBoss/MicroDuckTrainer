@@ -438,7 +438,9 @@ function runRollout(theta, layout, reward, steps, targetPoint, run, cmdArr) {
     if (T.forward?.enabled) {
       if (tracking) {
         const dvx = vx - cmd[0], dvy = vy - cmd[1];
-        val += T.forward.weight * Math.exp(-(dvx * dvx + dvy * dvy) / 0.25);
+        // v2.5: schärfere Kurve (σ² 0.25 → 0.09, gespiegelt aus es.ts):
+        // Stehen bei cmd 0.26 gibt nur noch ~47 % statt 76 % → LAUFEN lohnt sich.
+        val += T.forward.weight * Math.exp(-(dvx * dvx + dvy * dvy) / 0.09);
       } else {
         val += T.forward.weight * Math.max(0, 1 - Math.abs(vx - T.forward.param) / 0.5);
       }

@@ -195,6 +195,9 @@ export class Engine {
     this.imitPhase = null;
     // Positionaktuatoren (G1, kp=500): sonst zieht ctrl=0 die Gelenke nach 0!
     this.applyCtrlFromPose(this.standPose);
+    // v2.5: Obs-Buffer SOFORT frisch aufbauen — der erste Policy-Step nach
+    // einem Reset darf keine Stale-Obs aus der Zeit vor dem Reset lesen.
+    this.buildObs();
   }
 
   /** ctrl direkt auf Gelenk-Sollwerte setzen (Manuell-Modus / Recovery). */
@@ -286,10 +289,23 @@ export class Engine {
       if (lim) v = Math.min(lim[j * 2 + 1], Math.max(lim[j * 2], v));
       ctrl[j] = v;
     }
-    return this.stepPhysics();
+    // v2.5 KRITISCHER FIX: Obs VOR den Physik-Steps bauen. mj_step
+    // integriert sofort — die sensordata (Gyro!) reflektiert danach den
+    // Zustand VOR der Integration, während qpos/qvel bereits der neue
+    // Zustand sind. Nach-Step-Obs waren also ein VERMISCHTER Zustand
+    // (Gyro t−1 + Gelenke t) → die Policy lief ~1 s sauber und brach dann
+    // ein („fällt auf die Fresse"). Der validierte Rollout-Pfad (sim_probe)
+    // baut die Obs VOR dem Step — jetzt identisch hier.
+    const obs = this.buildObs();
+    for (let s = 0; s < this.meta.decimation; s++) {
+      this.mujoco!.mj_step(this.model, this.data);
+    }
+    return obs;
   }
 
-  /** Physik decimation-fach advanceieren und neue Obs bauen. */
+  /** Physik decimation-fach advanceieren und Obs bauen (ohne Policy-Aktion —
+   *  Recovery/Pose-Hold). Der obs-Buffer wird vom nächsten Policy-Step vor
+   *  dem Step ohnehin frisch überschrieben. */
   stepPhysics(): Float32Array {
     for (let s = 0; s < this.meta.decimation; s++) {
       this.mujoco!.mj_step(this.model, this.data);

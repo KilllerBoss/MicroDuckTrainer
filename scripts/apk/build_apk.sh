@@ -11,9 +11,9 @@ R8=$PWD/scripts/android-sdk/r8.jar
 APK=scripts/apk
 OUT=$PWD/out
 BUILD=$PWD/scripts/apk/build-v2
-VERSION_CODE=6
-VERSION_NAME=2.4
-FINAL=download/MicroDuckTrainer-v2.4.apk
+VERSION_CODE=7
+VERSION_NAME=2.5
+FINAL=download/MicroDuckTrainer-v2.5.apk
 
 rm -rf "$BUILD"
 mkdir -p "$BUILD/classes" "$BUILD/dexout" download

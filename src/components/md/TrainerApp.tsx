@@ -66,6 +66,7 @@ const INITIAL_TEL: Telemetry = {
     cmdTrain: true, cmdFwd: 0.25, curriculum: true, actionSmooth: 0.6,
     pushes: true, noiseReset: true, fitnessMode: "sum", weightDecay: 0.02 },
   trainPreview: true,
+  previewSpeed: 1,
   customCode: null,
   world: { enabled: false, seed: 0, difficulty: 0.4, density: 0.5,
     features: { treppen: true, huegel: true, loecher: false, hindernisse: true, stange: false } },

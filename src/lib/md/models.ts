@@ -40,6 +40,10 @@ export interface ModelMeta {
   fallUpZ: number; // projizierte Gravitation darüber (betragsmäßig) = gekippt
   targetHeight: number; // Soll-Höhe für Reward "Höhe"
   velocityLimit: { fwd: number; back: number; ang: number };
+  /** v2.5: Anfahr-Boden (m/s) – ab diesem cmd fährt das Modell real an.
+   *  Ente: ~0.26 (Node-Sim gemessen: 0.22 steht, 0.24 läuft). Darunter
+   *  belohnt der Tracking-Reward STEHEN → die Stehen-Falle im Training. */
+  cmdFloor: number;
   policies: PolicyDef[];
   defaultOnnx: string; // Policy-ID für den Boot
 }
@@ -106,6 +110,7 @@ export const MODELS: Record<ModelId, ModelMeta> = {
     fallUpZ: 0.5, // projizierte Gravitation > -0.5 → >60° gekippt (wie Original)
     targetHeight: 0.12,
     velocityLimit: { fwd: 0.25, back: -0.2, ang: 1.0 },
+    cmdFloor: 0.26,
     policies: DUCK_POLICIES,
     defaultOnnx: "BEST_alpha_walking",
   },
@@ -134,6 +139,7 @@ export const MODELS: Record<ModelId, ModelMeta> = {
     fallUpZ: 0.5,
     targetHeight: 0.72,
     velocityLimit: { fwd: 0.5, back: -0.4, ang: 1.0 },
+    cmdFloor: 0.12, // G1 trainiert ohne Warm-Start → moderater Boden
     policies: [],
     defaultOnnx: "",
   },

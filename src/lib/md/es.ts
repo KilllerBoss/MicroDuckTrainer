@@ -188,7 +188,9 @@ export function stepRewardValue(
   if (T.forward?.enabled) {
     if (tracking) {
       const dvx = vx - cmd0, dvy = vy - cmd1;
-      val += T.forward.weight * Math.exp(-(dvx * dvx + dvy * dvy) / 0.25);
+      // v2.5: schärfere Kurve (σ² 0.25 → 0.09): Stehen bei cmd 0.26 gibt nur
+      // noch ~47 % statt 76 % — Stehen lohnt sich nicht mehr, LAUFEN schon.
+      val += T.forward.weight * Math.exp(-(dvx * dvx + dvy * dvy) / 0.09);
     } else {
       val += T.forward.weight * Math.max(0, 1 - Math.abs(vx - T.forward.param) / 0.5);
     }
@@ -630,14 +632,26 @@ export class EsTrainer {
   }
 
   /** v2.3: Befehl für ein antithetisches Paar ziehen (beide Mitglieder gleich,
-   *  sonst vergleicht der Gradient Äpfel mit Birnen). */
+   *  sonst vergleicht der Gradient Äpfel mit Birnen).
+   *  v2.5: Anfahr-Boden gegen die STEHEN-FALLE: Der Tracking-Reward gab
+   *  Stehen bei Mini-cmd fast die volle Punktzahl (cmd 0.09, vx 0 → 97 %).
+   *  Vorwärts-Befehle liegen deshalb nie unter meta.cmdFloor (Ente 0.26:
+   *  darunter fährt die Warm-Start-Policy real nicht an). Curriculum wirkt
+   *  jetzt auf dem Bereich ÜBER dem Boden (Tempo-Vielfalt), nicht darunter. */
   private sampleCmd(): Float32Array | null {
     if (!this.runCfg.cmdTrain) return null;
     const s = this.speedScale;
     const cmd = new Float32Array(this.meta.cmdSize);
     // ~75 % vorwärts, sonst leicht rückwärts/stand – repräsentative Mischung
-    const fwd = Math.random() < 0.75 ? Math.random() : Math.random() * 0.35 - 0.35;
-    cmd[0] = this.runCfg.cmdFwd * s * fwd;
+    const draw = Math.random();
+    const hi = this.runCfg.cmdFwd * s;
+    if (draw < 0.75) {
+      // vorwärts: [0,1] → [max(cmdFloor, hi), hi], immer ≥ Anfahr-Boden
+      const lo = Math.min(this.meta.cmdFloor, this.runCfg.cmdFwd);
+      cmd[0] = Math.max(lo, hi);
+    } else {
+      cmd[0] = hi * (Math.random() * 0.35 - 0.35);
+    }
     if (cmd.length > 1) cmd[1] = this.runCfg.cmdLat * (Math.random() * 2 - 1) * 0.6 * s;
     if (cmd.length > 2) cmd[2] = this.runCfg.cmdAng * (Math.random() * 2 - 1) * 0.7;
     return cmd;
@@ -690,6 +704,18 @@ export class EsTrainer {
       cmds.push(c, c);
     }
     const t0 = performance.now();
+    // v2.5: WARM-START-ANKER: Vor der ersten Generation den Ausgangs-Theta
+    // (Warm-Start-Läufer) selbst evaluieren und als bestEver/bestTheta
+    // verankern. Sonst setzte das erste epsilon-Mitglied bestEver/bestTheta
+    // (bestEver startete bei -Infinity!) und die Live-Vorschau zeigte ein
+    // verrauschtes Mediokritäts-Glied statt des lauffähigen Warm-Starts —
+    // der sichtbare „fällt auf die Fresse"-Effekt. bestTheta ist jetzt nie
+    // schlechter als der Start-Punkt.
+    if (this.bestEver === -Infinity) {
+      const [warmRes] = await this.evalBatch([this.theta.slice()], [this.sampleCmd()]);
+      this.bestEver = warmRes.fitness;
+      this.bestTheta = this.theta.slice();
+    }
     const results = await this.evalBatch(members.slice(0, pop), cmds.slice(0, pop));
     const dt = Math.max(1, performance.now() - t0);
     this.stepsPerSec = (this.stepsCounter / dt) * 1000;

@@ -95,3 +95,51 @@ Work Log:
 Stage Summary:
 - v2.4 (versionCode 6): Live-Vorschau + Auto-Gehen + Recovery-Timeout + Curriculum-Härtung.
 - APK-Build + Release v2.4.0 folgen im nächsten Task.
+
+---
+Task ID: 9 (v2.5 Tempo-Sync + Obs-Timing-Fix + idle.glb)
+Agent: main (Super Z)
+Task: "Ente fällt beim Training auf die Fresse / bewegt sich nicht" — Ursache + Fix; Trainings-Tempo ↔ Physik synchronisieren; GLB idle.glb (Mixamo, 120 fps) fürs Lernen freischalten; Chat-Guide.
+
+Work Log:
+- ROOT-CAUSE (Endlich!): engine.stepWithAction baute die Observation NACH den 4
+  Physik-Substeps. mj_step integriert sofort → sensordata (Gyro!) reflektierte
+  den Zustand VOR der Integration, qpos/qvel den neuen → VERMISCHTER Obs-Zustand
+  (Gyro t−1 + Gelenke t). Folge: Policy läuft ~1 s sauber an, bricht dann ein
+  (Fell bei Step 20–45), Vorschau-Ente „fällt auf die Fresse". Der validierte
+  Node-Sim (sim_probe) baut Obs VOR dem Step — deshalb lief dort alles.
+  Beweiskette: kompilierte Modelle Browser↔Probe 0 Diffs; obs-Feld-Diff 0;
+  Mini-Probe im Browser (manuelle obs) 120 Steps stabil; Engine-Pfad fiel bei 42.
+- Fix (engine.ts): stepWithAction → buildObs() VOR den Substeps; stepPhysics
+  behält buildObs (Recovery); resetToKeyframe baut Obs frisch (kein Stale-Start).
+- QA nach Fix (Browser, deterministisch, Loop gestoppt): 300 Steps cmd 0.24 →
+  dx 0→0.601 m (~0.24 m/s exakt Befehlstempo), z stabil 0.116–0.120, kein Fall,
+  kein Zittern. Warm-Start-Läufer sichtbar in der Vorschau.
+- Tempo-Sync (Nutzerwunsch): controlLoop multipliziert die Sim-Steps pro Frame
+  mit dem Turbo-Faktor (cap 6×) während Training+Vorschau — adaptiver Abstieg
+  bei schwachen Geräten (Iteration > 1,35× Budget → Stufe runter). Telemetrie
+  + Panel-Badge „⏩ Welt: N× sync". Gemessen: Turbo 4 → previewSpeed 4.
+- Vorschau-Härtung: previewCmd IMMER ≥ 0.24 m/s vorwärts (Ente fährt erst ab
+  ~0.24 an — Node-Sim-Messung), sanftes Gieren ±0.2, kein Rückwärts-Zufall mehr;
+  Recovery-Timeout setzt previewCmdT=0 (frischer sicherer Befehl).
+- STEHEN-FALLE im Training behoben: Tracking-Reward gab Stehen bei Mini-cmd
+  ~97 % Punktzahl (cmd 0.09, vx 0). Neu: meta.cmdFloor (Ente 0.26, G1 0.12),
+  sampleCmd zieht Vorwärts-cmds NIE unter den Anfahr-Boden; Tracking-Kurve
+  geschärft (σ² 0.25→0.09, gespiegelt in es-worker.js).
+- Warm-Start-ANKER: bestEver startete bei −∞ → das erste ε-Mitglied setzte
+  bestTheta (nicht der lauffähige Warm-Start!) → Vorschau zeigte Mediokrität.
+  Jetzt: Warm-Start wird vor Gen 1 selbst evaluiert und als bestTheta verankert.
+- Aktions-Glättung (EMA) jetzt auch im sichtbaren Pfad (identisch zum Training),
+  Resets an allen Recovery-/Pose-/Keyframe-Stellen.
+- Syntax-Bug startG1Blend behoben (korrupte Zeile aus unterbrochenem Edit).
+- idle.glb (Mixamo-Humanoid, „KillerBossIdle_120fps", 9 s): activateAnimation →
+  14/14 Enten-Gelenke gemappt (Hüfte×3/Knie/Knöchel je Seite + Hals), 271 Frames
+  @30 Hz, baseY 0.936 → scaleY 0.128 (Cross-Species). Training läuft (Gen 170,
+  Fitness 317, Ente hält Zielhöhe 0.12 — aufrecht, kein Sturz-Loop).
+- APK v2.5 (versionCode 7), Release v2.5.0.
+
+Stage Summary:
+- v2.5 behebt DEN Kern: Obs-Timing-Bug im sichtbaren Pfad (Vorschau/ONNX/ES),
+  Stehen-Falle im Reward, Warm-Start-Anker, Tempo-Sync (Turbo beschleunigt
+  sichtbare Physik synchron, max 6×, adaptiv), idle.glb funktioniert end-to-end.
+- Download: https://github.com/KilllerBoss/MicroDuckTrainer/releases/download/v2.5.0/MicroDuckTrainer-v2.5.apk

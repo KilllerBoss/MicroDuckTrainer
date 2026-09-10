@@ -76,6 +76,7 @@ console.log("Meshes im VFS:", uniq.length);
 const model = mujoco.MjModel.from_xml_string(src, vfs);
 const data = new mujoco.MjData(model);
 console.log("nq", model.nq, "nu", model.nu, "nkey", model.nkey);
+if (process.env.CLAMP === "1") { for (let j = 0; j < 14; j += 1) console.log("ctrlrange", j, model.actuator_ctrlrange[j*2].toFixed(2), model.actuator_ctrlrange[j*2+1].toFixed(2)); }
 
 const MJ_OBJ_KEY = mujoco.mjtObj.mjOBJ_KEY.value ?? 6;
 const keyId = mujoco.mj_name2id(model, MJ_OBJ_KEY, "STAND");
@@ -212,14 +213,22 @@ for (let t = 0; t < STEPS; t++) {
   for (let j = 0; j < 14; j++) obs[i++] = qvel[dofAdr[j]];
   for (let j = 0; j < 14; j++) obs[i++] = lastAction[j];
   for (let c = 0; c < 13; c++) obs[i++] = cmd[c];
-  const raw = forward(obs);
+  const raw = process.env.ZEROACT === "1" ? new Float32Array(14) : forward(obs);
   const prev = action;
   action = new Float32Array(14);
   for (let j = 0; j < 14; j++) action[j] = SMOOTH < 0.999 ? SMOOTH * raw[j] + (1 - SMOOTH) * prev[j] : raw[j];
   lastAction.set(action);
   // ctrl = defaultPose + action
   const ctrl = data.ctrl;
-  for (let j = 0; j < 14; j++) ctrl[j] = DUCK_DEFAULT_POSE[j] + action[j];
+  if (process.env.CLAMP === "1") {
+    for (let j = 0; j < 14; j++) {
+      const lo = model.actuator_ctrlrange[j * 2], hi = model.actuator_ctrlrange[j * 2 + 1];
+      let v = DUCK_DEFAULT_POSE[j] + action[j];
+      ctrl[j] = v < lo ? lo : v > hi ? hi : v;
+    }
+  } else {
+    for (let j = 0; j < 14; j++) ctrl[j] = DUCK_DEFAULT_POSE[j] + action[j];
+  }
   for (let s = 0; s < 4; s++) mujoco.mj_step(model, data);
   if (process.env.PUSH === "1" && t > 0 && t % 55 === 0) {
     const qv = data.qvel;
