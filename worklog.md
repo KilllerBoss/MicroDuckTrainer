@@ -143,3 +143,30 @@ Stage Summary:
   Stehen-Falle im Reward, Warm-Start-Anker, Tempo-Sync (Turbo beschleunigt
   sichtbare Physik synchron, max 6×, adaptiv), idle.glb funktioniert end-to-end.
 - Download: https://github.com/KilllerBoss/MicroDuckTrainer/releases/download/v2.5.0/MicroDuckTrainer-v2.5.apk
+
+---
+Task ID: v2.6
+Agent: Super Z (Main)
+Task: v2.6 — Stürze zahlen NIE + REWARD-NaN-Beseitigung + G1-Arme + APK/Release
+
+Work Log:
+- Workspace-Restore aus GitHub v2.2.0 (erneuter Reset), Wiederherstellung aller v2.3-Edits
+- ENDECKT: GitHub main enthielt bereits v2.4/v2.5 (Live-Vorschau, Tempo-Sync/Turbo bis 6×,
+  cmdFloor gegen Stehen-Falle, Obs-Timing-Fix, Warm-Start-Anker, idle.glb 14/14 gemappt)
+- Merge v2.5 + meine v2.3-Linie; Konflikte zugunsten v2.5-Basis aufgelöst
+- v2.6 NaN-Härtung (Ursache "REWARD NaN"): Guards in ctxStep (es.ts), es-worker.js,
+  evalBatch-Ergebnissen, Test-Modus-Reward ×2, imitSampleAt + imitation.ts Quaternion-
+  Normalisierung (Zero-Length-Keys → NaN beim Slerp)
+- FÄLLE ZAHLEN NIE (Nutzerbefund "fällt und bekommt Punkte"):
+  * Test-Modus: Bodenzeit/Wiederherstellung bringt 0 Punkte; einmalige Sturz-Strafe pro Fall
+  * Rollouts (Sum-Modus): Sturz kostet zusätzlich alive × Restzeit — frühes Fallen = netto NEGATIV
+  * NaN-Runden zählen als Totalausfall mit Restzeit-Strafe
+- G1-Arme natürlich (Ellbogen 0.45 statt 1.28, Schultern 0.35/±0.1) in Engine + Worker
+- QA (agent-browser): App bootet ohne Fehler; G1 steht mit entspannten, herabhängenden Armen
+  (Screenshot upload/qa_g1_arms.png), HÖHE 0.79 m, kein Zittern
+- APK v2.6 (versionCode 8) gebaut: Temurin-JDK-21-portable + build-tools r34 (libc++.so nachgerüstet),
+  signiert mit microduck-trainer.keystore (gleiche Signatur wie v2.x)
+
+Stage Summary:
+- v2.6 = v2.5 + ehrliche Bestrafung + NaN-feste Rollouts + natürliche G1-Arme
+- APK: download/MicroDuckTrainer-v2.6.apk (39,7 MB), Release v2.6.0
