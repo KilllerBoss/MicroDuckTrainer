@@ -1,0 +1,1067 @@
+     1→     1→// ── MicroDuck Trainer v2.0 – App-Kern (Engine + Loop + Modi) ─────────────────
+     2→     2→// Kapselt die komplette Laufzeit: MuJoCo-Engine, three.js-Welt, ONNX-Policies,
+     3→     3→// ES-Training, Gamepad-Mappings, Modi (Manuell/Training/Test) und Auto-Recovery.
+     4→     4→// Die React-UI erhält alles über Telemetrie-Callbacks (throttled, 4 Hz).
+     5→     5→
+     6→     6→import { Engine } from "./engine";
+     7→     7→import {
+     8→     8→  createWorld, mountRig, syncDuck, syncG1, syncBall,
+     9→     9→  type World,
+    10→    10→} from "./rig";
+    11→    11→import { OnnxPolicy, MlpPolicy, warmStartMlp, type MlpLayout } from "./policy";
+    12→    12→import { getModel, type ModelId } from "./models";
+    13→    13→import { EsTrainer, stepRewardValue, type EsStats, type TurboLevel, type ImitEvalData } from "./es";
+    14→    14→import type { MappingEntry, SourceId } from "./mapping";
+    15→    15→import { poseById, loadMapping, saveMapping } from "./mapping";
+    16→    16→import { loadRewardConfig, saveRewardConfig, type RewardConfig } from "./rewards";
+    17→    17→import {
+    18→    18→  defaultWorldConfig, generateWorld, arenaHalf, randomSeed,
+    19→    19→  buildWorldMeshes, type WorldConfig, type WorldBuild,
+    20→    20→} from "./worldgen";
+    21→    21→import {
+    22→    22→  buildImitClip, targetAt, rootDeltaAt, saveImitPrefs,
+    23→    23→  type ImitClip,
+    24→    24→} from "./imitation";
+    25→    25→
+    26→    26→
+    27→    27→export type Mode = "manuell" | "training" | "test";
+    28→    28→export type PolicySource = "onnx" | "es";
+    29→    29→
+    30→    30→export interface Telemetry {
+    31→    31→  booted: boolean;
+    32→    32→  loading: boolean;
+    33→    33→  loadingText: string;
+    34→    34→  error: string | null;
+    35→    35→  modelId: ModelId | null;
+    36→    36→  mode: Mode;
+    37→    37→  source: PolicySource;
+    38→    38→  onnxId: string;
+    39→    39→  overridePolicy: string | null;
+    40→    40→  esReady: boolean; // ES-Policy vorhanden (trainiert/geladen)?
+    41→    41→  speed: number;
+    42→    42→  height: number;
+    43→    43→  ctrlHz: number;
+    44→    44→  recovering: boolean;
+    45→    45→  fallen: boolean;
+    46→    46→  testUptime: number;
+    47→    47→  testReward: number;
+    48→    48→  training: boolean;
+    49→    49→  es: EsStats | null;
+    50→    50→  mappings: MappingEntry[];
+    51→    51→  reward: RewardConfig;
+    52→    52→  // ── v2.1 ──
+    53→    53→  world: WorldConfig;
+    54→    54→  pointMode: boolean;
+    55→    55→  point: [number, number];
+    56→    56→  imitation: {
+    57→    57→    name: string; duration: number; playing: boolean; time: number; mapped: number; manual: boolean;
+    58→    58→  } | null;
+    59→    59→}
+    60→    60→
+    61→    61→// Enten-Tempos wie reference/constants.js
+    62→    62→const VEL_FWD = 0.25, VEL_BACK = -0.2, VEL_ANG = 1.0, VEL_LAT = 0.4;
+    63→    63→
+    64→    64→const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+    65→    65→
+    66→    66→export class TrainerCore {
+    67→    67→  // ── Callbacks (React-Seite) ──
+    68→    68→  onTelemetry: (t: Telemetry) => void = () => {};
+    69→    69→
+    70→    70→  // ── Laufzeit-Zustand ──
+    71→    71→  private world: World | null = null;
+    72→    72→  private engine = new Engine();
+    73→    73→  private modelId: ModelId | null = null;
+    74→    74→
+    75→    75→  private sessions = new Map<string, Promise<OnnxPolicy>>();
+    76→    76→  private esView: MlpPolicy | null = null;
+    77→    77→  private trainer: EsTrainer | null = null;
+    78→    78→
+    79→    79→  // UI-Modi
+    80→    80→  private mode: Mode = "manuell";
+    81→    81→  private source: PolicySource = "onnx";
+    82→    82→  private selectedOnnx = "";
+    83→    83→  private overridePolicy: string | null = null; // Gamepad-Button hat umgeschaltet
+    84→    84→  private mappings: MappingEntry[] = [];
+    85→    85→  private rewardCfg: RewardConfig | null = null;
+    86→    86→  private autoRecovery = true; // Test-Modus: sanftes Aufrichten nach Sturz
+    87→    87→
+    88→    88→  // Gamepad-Eingaben
+    89→    89→  private joy = { x: 0, y: 0 };
+    90→    90→  private pendingPolicyId: string | null = null;
+    91→    91→  private pendingPoseId: string | null = null;
+    92→    92→
+    93→    93→  // ── v2.1: Welt, Punkt-Modus, Imitation ──
+    94→    94→  private worldCfg: WorldConfig = defaultWorldConfig();
+    95→    95→  private worldBuild: WorldBuild | null = null;
+    96→    96→  private pointMode = false;
+    97→    97→  private point: [number, number] = [0.8, 0];
+    98→    98→  private imitClip: ImitClip | null = null;
+    99→    99→  private imitPlaying = false;
+   100→   100→  private imitManual = false;
+   101→   101→  private imitTime = 0;
+   102→   102→  private imitTargetBuf: Float32Array | null = null;
+   103→   103→  private esObsExtra = 0; // Obs-Extra der aktuellen esView
+   104→   104→
+   105→   105→  // Posen-Blending
+   106→   106→  private g1Base: Float32Array | null = null;
+   107→   107→  private g1Blend: { from: Float32Array; to: Float32Array; t0: number; dur: number } | null = null;
+   108→   108→  private duckPoseHold: { from: Float32Array; to: Float32Array; t0: number; blendMs: number; holdMs: number } | null = null;
+   109→   109→
+   110→   110→  // Auto-Recovery (Test-Modus)
+   111→   111→  private recovering = false;
+   112→   112→  private recoverySteps = 0;
+   113→   113→  private recoveryUpright = 0;
+   114→   114→  private fallDebounce = 0;
+   115→   115→
+   116→   116→  // Test-Statistik
+   117→   117→  private testStart = 0;
+   118→   118→  private testUptime = 0;
+   119→   119→  private testReward = 0;
+   120→   120→  private prevAct: Float32Array = new Float32Array(0);
+   121→   121→  private actBuf: Float32Array = new Float32Array(0);
+   122→   122→
+   123→   123→  // Loops
+   124→   124→  private running = false;
+   125→   125→  private trainingActive = false;
+   126→   126→  private ctrlHz = 0;
+   127→   127→  private lastFrameT = 0;
+   128→   128→  private lastEmit = 0;
+   129→   129→
+   130→   130→  // Boot/Load-Status
+   131→   131→  private booted = false;
+   132→   132→  private loading = false;
+   133→   133→  private loadingText = "";
+   134→   134→  private error: string | null = null;
+   135→   135→
+   136→   136→  // ── Boot ────────────────────────────────────────────────────────────────────
+   137→   137→
+   138→   138→  async boot(container: HTMLElement): Promise<void> {
+   139→   139→    try {
+   140→   140→      this.world = await createWorld(container);
+   141→   141→      await this.loadModel("microduck");
+   142→   142→      this.booted = true;
+   143→   143→      this.running = true;
+   144→   144→      if (typeof window !== "undefined") (window as any).__mdt = this; // QA-Hook
+   145→   145→      this.lastFrameT = performance.now();
+   146→   146→      void this.controlLoop();
+   147→   147→      requestAnimationFrame(this.renderLoop);
+   148→   148→      this.emit();
+   149→   149→    } catch (err: any) {
+   150→   150→      this.error = err?.message || String(err);
+   151→   151→      console.error("[core] Boot fehlgeschlagen:", err);
+   152→   152→      this.emit();
+   153→   153→    }
+   154→   154→  }
+   155→   155→
+   156→   156→  /** Modell wechseln (oder gleiches neu starten): disposed alles Alte. */
+   157→   157→  async loadModel(id: ModelId): Promise<void> {
+   158→   158→    if (this.loading) return;
+   159→   159→    this.loading = true;
+   160→   160→    this.loadingText = id === "microduck" ? "Lade Ente…" : "Lade G1 (29 Gelenke)…";
+   161→   161→    this.emit();
+   162→   162→    try {
+   163→   163→      // Training anhalten + Trainer wegwerfen (Obs-Dimensionen ändern sich!)
+   164→   164→      this.trainingActive = false;
+   165→   165→      this.trainer?.dispose();
+   166→   166→      this.trainer = null;
+   167→   167→      this.esView = null;
+   168→   168→      this.resetTransientState();
+   169→   169→      this.mode = "manuell";
+   170→   170→
+   171→   171→      const meta = getModel(id);
+   172→   172→      const needRig = this.modelId !== id ||
+   173→   173→        !(this.world && (id === "microduck" ? this.world.duckRig : this.world.g1Rig));
+   174→   174→
+   175→   175→      // Welt-Konfiguration (global persistiert) auf dieses Modell anwenden
+   176→   176→      this.worldCfg = loadWorldPrefs();
+   177→   177→      this.worldBuild = this.worldCfg.enabled ? generateWorld(this.worldCfg, id) : null;
+   178→   178→      this.applyWorldVisuals();
+   179→   179→      this.pointMode = loadPointPrefs(id);
+   180→   180→      this.point = [0.8, 0];
+   181→   181→
+   182→   182→      const tasks: Promise<any>[] = [this.engine.load(id, this.worldBuild)];
+   183→   183→      if (needRig && this.world) tasks.push(mountRig(this.world, id));
+   184→   184→      if (id === "microduck") tasks.push(this.getOnnxSession(meta.defaultOnnx).catch(() => null));
+   185→   185→      await Promise.all(tasks);
+   186→   186→
+   187→   187→      this.modelId = id;
+   188→   188→      this.selectedOnnx = meta.defaultOnnx;
+   189→   189→      this.source = "onnx";
+   190→   190→      this.g1Base = new Float32Array(this.engine.standPose);
+   191→   191→      this.esObsExtra = 0;
+   192→   192→      this.engine.setImitObs(false);
+   193→   193→      this.engine.targetPoint = this.pointMode ? [...this.point] as [number, number] : null;
+   194→   194→      this.prevAct = new Float32Array(meta.actionDim);
+   195→   195→      this.actBuf = new Float32Array(meta.actionDim);
+   196→   196→      // Mappings + Bewertung pro Modell laden (Persistenz)
+   197→   197→      this.mappings = loadMapping(id);
+   198→   198→      this.rewardCfg = loadRewardConfig(id);
+   199→   199→      this.testUptime = 0;
+   200→   200→      this.testReward = 0;
+   201→   201→      this.error = null;
+   202→   202→    } catch (err: any) {
+   203→   203→      this.error = err?.message || String(err);
+   204→   204→      console.error("[core] Modell-Load fehlgeschlagen:", err);
+   205→   205→    } finally {
+   206→   206→      this.loading = false;
+   207→   207→      this.emit();
+   208→   208→    }
+   209→   209→  }
+   210→   210→
+   211→   211→  private resetTransientState() {
+   212→   212→    this.overridePolicy = null;
+   213→   213→    this.pendingPolicyId = null;
+   214→   214→    this.pendingPoseId = null;
+   215→   215→    this.duckPoseHold = null;
+   216→   216→    this.g1Blend = null;
+   217→   217→    this.recovering = false;
+   218→   218→    this.fallDebounce = 0;
+   219→   219→    this.joy.x = 0;
+   220→   220→    this.joy.y = 0;
+   221→   221→    this.imitTime = 0;
+   222→   222→  }
+   223→   223→
+   224→   224→  // ── Setter (von der UI) ─────────────────────────────────────────────────────
+   225→   225→
+   226→   226→  setMode(mode: Mode) {
+   227→   227→    if (this.mode === mode) return;
+   228→   228→    this.mode = mode;
+   229→   229→    this.overridePolicy = null;
+   230→   230→    this.recovering = false;
+   231→   231→    this.fallDebounce = 0;
+   232→   232→    if (mode === "test") {
+   233→   233→      this.testStart = performance.now();
+   234→   234→      this.testUptime = 0;
+   235→   235→      this.testReward = 0;
+   236→   236→      this.prevAct.fill(0);
+   237→   237→    }
+   238→   238→    this.emit();
+   239→   239→  }
+   240→   240→
+   241→   241→  setSource(source: PolicySource) {
+   242→   242→    this.source = source;
+   243→   243→    this.overridePolicy = null;
+   244→   244→    this.emit();
+   245→   245→  }
+   246→   246→
+   247→   247→  setOnnx(id: string) {
+   248→   248→    this.selectedOnnx = id;
+   249→   249→    this.overridePolicy = null;
+   250→   250→    void this.getOnnxSession(id);
+   251→   251→    this.emit();
+   252→   252→  }
+   253→   253→
+   254→   254→  setMappings(mappings: MappingEntry[], persist = true) {
+   255→   255→    this.mappings = mappings;
+   256→   256→    if (persist && this.modelId) saveMapping(this.modelId, mappings);
+   257→   257→    this.emit();
+   258→   258→  }
+   259→   259→
+   260→   260→  setReward(cfg: RewardConfig, persist = true) {
+   261→   261→    this.rewardCfg = cfg;
+   262→   262→    this.trainer?.setReward(cfg);
+   263→   263→    if (persist && this.modelId) saveRewardConfig(this.modelId, cfg);
+   264→   264→    this.emit();
+   265→   265→  }
+   266→   266→
+   267→   267→  setJoystick(x: number, y: number) {
+   268→   268→    this.joy.x = clamp(x, -1, 1);
+   269→   269→    this.joy.y = clamp(y, -1, 1);
+   270→   270→  }
+   271→   271→
+   272→   272→  setAutoRecovery(on: boolean) {
+   273→   273→    this.autoRecovery = on;
+   274→   274→    if (!on) this.recovering = false;
+   275→   275→    this.emit();
+   276→   276→  }
+   277→   277→
+   278→   278→  // ── v2.1: Welt ─────────────────────────────────────────────────────────────
+   279→   279→
+   280→   280→  async setWorld(cfg: WorldConfig): Promise<void> {
+   281→   281→    if (this.loading) return;
+   282→   282→    this.loading = true;
+   283→   283→    this.loadingText = "Baue Welt…";
+   284→   284→    this.emit();
+   285→   285→    try {
+   286→   286→      this.stopTraining();
+   287→   287→      this.trainer?.dispose();
+   288→   288→      this.trainer = null;
+   289→   289→      this.esView = null;
+   290→   290→      this.esObsExtra = 0;
+   291→   291→      this.worldCfg = { ...cfg, features: { ...cfg.features } };
+   292→   292→      saveWorldPrefs(this.worldCfg);
+   293→   293→      this.worldBuild = this.worldCfg.enabled
+   294→   294→        ? generateWorld(this.worldCfg, this.modelId ?? "microduck")
+   295→   295→        : null;
+   296→   296→      this.applyWorldVisuals();
+   297→   297→      await this.engine.load(this.modelId ?? "microduck", this.worldBuild);
+   298→   298→      this.engine.targetPoint = this.pointMode ? ([...this.point] as [number, number]) : null;
+   299→   299→      this.error = null;
+   300→   300→    } catch (err: any) {
+   301→   301→      this.error = err?.message || String(err);
+   302→   302→      console.error("[core] Welt-Build fehlgeschlagen:", err);
+   303→   303→    } finally {
+   304→   304→      this.loading = false;
+   305→   305→      this.emit();
+   306→   306→    }
+   307→   307→  }
+   308→   308→
+   309→   309→  rerollWorld(): void {
+   310→   310→    void this.setWorld({ ...this.worldCfg, seed: randomSeed() });
+   311→   311→  }
+   312→   312→
+   313→   313→  get worldConfig(): WorldConfig {
+   314→   314→    return this.worldCfg;
+   315→   315→  }
+   316→   316→
+   317→   317→  private applyWorldVisuals(): void {
+   318→   318→    if (!this.world) return;
+   319→   319→    this.world.setWorldProps(this.worldBuild ? buildWorldMeshes(this.worldBuild) : null);
+   320→   320→  }
+   321→   321→
+   322→   322→  // ── v2.1: Punkt-Modus ──────────────────────────────────────────────────────
+   323→   323→
+   324→   324→  setPointMode(on: boolean): void {
+   325→   325→    this.pointMode = on;
+   326→   326→    if (this.modelId) savePointPrefs(this.modelId, on);
+   327→   327→    this.engine.targetPoint = on ? ([...this.point] as [number, number]) : null;
+   328→   328→    this.trainer?.setTargetPoint(on ? ([...this.point] as [number, number]) : null);
+   329→   329→    this.emit();
+   330→   330→  }
+   331→   331→
+   332→   332→  get isPointMode(): boolean {
+   333→   333→    return this.pointMode;
+   334→   334→  }
+   335→   335→
+   336→   336→  // ── v2.1: Imitation ────────────────────────────────────────────────────────
+   337→   337→
+   338→   338→  /** GLB-Clip bauen und aktivieren; Reward-Terme automatisch scharf schalten. */
+   339→   339→  async activateAnimation(
+   340→   340→    buffer: ArrayBuffer, clipIndex: number, mirror: boolean, modelId: ModelId,
+   341→   341→  ): Promise<{ ok: boolean; message: string }> {
+   342→   342→    try {
+   343→   343→      if (this.trainingActive) this.stopTraining();
+   344→   344→      this.trainer?.dispose();
+   345→   345→      this.trainer = null;
+   346→   346→      this.esView = null;
+   347→   347→      this.esObsExtra = 0;
+   348→   348→      const meta = getModel(modelId);
+   349→   349→      const clip = await buildImitClip(buffer, clipIndex, meta, mirror);
+   350→   350→      if (clip.mapped === 0) {
+   351→   351→        return { ok: false, message: "Keine Gelenke gemappt – Skeleton-Namen nicht erkannt." };
+   352→   352→      }
+   353→   353→      this.imitClip = clip;
+   354→   354→      this.imitPlaying = true;
+   355→   355→      this.imitTime = 0;
+   356→   356→      this.imitTargetBuf = new Float32Array(clip.dim);
+   357→   357→      this.engine.imitTarget = this.imitTargetBuf;
+   358→   358→      this.engine.imitRootDelta = null;
+   359→   359→      this.engine.setImitObs(true);
+   360→   360→      saveImitPrefs(modelId, clip.name, mirror);
+   361→   361→      // Terme automatisch aktivieren, falls beide aus
+   362→   362→      if (this.rewardCfg) {
+   363→   363→        const im = this.rewardCfg.terms.imitate;
+   364→   364→        const ih = this.rewardCfg.terms.imitHeight;
+   365→   365→        let changed = false;
+   366→   366→        if (im && !im.enabled) { im.enabled = true; im.weight = Math.max(1.5, Math.abs(im.weight)); changed = true; }
+   367→   367→        if (ih && !ih.enabled) { ih.enabled = true; ih.weight = Math.max(1.0, Math.abs(ih.weight)); changed = true; }
+   368→   368→        if (changed && this.modelId) saveRewardConfig(this.modelId, this.rewardCfg);
+   369→   369→      }
+   370→   370→      this.emit();
+   371→   371→      return {
+   372→   372→        ok: true,
+   373→   373→        message: `${clip.mapped} Gelenke gemappt · ${clip.duration.toFixed(1)} s · ${clip.name}`,
+   374→   374→      };
+   375→   375→    } catch (err: any) {
+   376→   376→      console.error("[core] Animations-Load fehlgeschlagen:", err);
+   377→   377→      return { ok: false, message: err?.message || String(err) };
+   378→   378→    }
+   379→   379→  }
+   380→   380→
+   381→   381→  clearAnimation(): void {
+   382→   382→    this.imitClip = null;
+   383→   383→    this.imitPlaying = false;
+   384→   384→    this.imitManual = false;
+   385→   385→    this.imitTargetBuf = null;
+   386→   386→    this.engine.imitTarget = null;
+   387→   387→    this.engine.imitRootDelta = null;
+   388→   388→    this.engine.imitPhase = null;
+   389→   389→    this.engine.setImitObs(false);
+   390→   390→    this.emit();
+   391→   391→  }
+   392→   392→
+   393→   393→  setImitPlaying(on: boolean): void {
+   394→   394→    if (!this.imitClip) return;
+   395→   395→    this.imitPlaying = on;
+   396→   396→    if (!on) {
+   397→   397→      this.engine.imitTarget = null;
+   398→   398→      this.engine.imitRootDelta = null;
+   399→   399→      this.engine.imitPhase = null;
+   400→   400→    } else {
+   401→   401→      this.engine.imitTarget = this.imitTargetBuf;
+   402→   402→    }
+   403→   403→    this.emit();
+   404→   404→  }
+   405→   405→
+   406→   406→  get imitState(): ImitClip | null {
+   407→   407→    return this.imitClip;
+   408→   408→  }
+   409→   409→
+   410→   410→  get isImitPlaying(): boolean {
+   411→   411→    return this.imitPlaying;
+   412→   412→  }
+   413→   413→
+   414→   414→  get isImitManual(): boolean {
+   415→   415→    return this.imitManual;
+   416→   416→  }
+   417→   417→
+   418→   418→  setImitManual(on: boolean): void {
+   419→   419→    this.imitManual = on;
+   420→   420→    this.emit();
+   421→   421→  }
+   422→   422→
+   423→   423→  pressButton(source: SourceId) {
+   424→   424→    const m = this.mappings.find((e) => e.source === source);
+   425→   425→    if (!m) return;
+   426→   426→    if (m.targetType === "policy") this.pendingPolicyId = m.target;
+   427→   427→    else if (m.targetType === "pose") this.pendingPoseId = m.target;
+   428→   428→  }
+   429→   429→
+   430→   430→  resetSim() {
+   431→   431→    this.resetTransientState();
+   432→   432→    this.engine.resetToKeyframe();
+   433→   433→    if (this.modelId === "unitree_g1") this.g1Base = new Float32Array(this.engine.standPose);
+   434→   434→    this.prevAct.fill(0);
+   435→   435→    this.emit();
+   436→   436→  }
+   437→   437→
+   438→   438→  // ── ONNX-Sessions (lazy, gecacht) ───────────────────────────────────────────
+   439→   439→
+   440→   440→  private getOnnxSession(id: string): Promise<OnnxPolicy | null> {
+   441→   441→    const meta = this.modelId ? getModel(this.modelId) : null;
+   442→   442→    const def = meta?.policies.find((p) => p.id === id);
+   443→   443→    if (!def) return Promise.resolve(null);
+   444→   444→    let p = this.sessions.get(def.url);
+   445→   445→    if (!p) {
+   446→   446→      p = OnnxPolicy.create(def.url).catch((err) => {
+   447→   447→        console.warn("[core] ONNX-Load fehlgeschlagen:", def.url, err);
+   448→   448→        this.sessions.delete(def.url);
+   449→   449→        throw err;
+   450→   450→      });
+   451→   451→      this.sessions.set(def.url, p);
+   452→   452→    }
+   453→   453→    return p;
+   454→   454→  }
+   455→   455→
+   456→   456→  // ── ES-Training ─────────────────────────────────────────────────────────────
+   457→   457→
+   458→   458→  async startTraining(): Promise<void> {
+   459→   459→    if (this.trainingActive || !this.modelId) return;
+   460→   460→    try {
+   461→   461→      const imitActive = !!(this.imitClip && this.imitPlaying);
+   462→   462→      const obsExtra = imitActive ? 2 : 0;
+   463→   463→      const imitData: ImitEvalData | null = imitActive && this.imitClip
+   464→   464→        ? {
+   465→   465→            dim: this.imitClip.dim, frames: this.imitClip.frames, fps: this.imitClip.fps,
+   466→   466→            duration: this.imitClip.duration, targets: this.imitClip.targets,
+   467→   467→            rootY: this.imitClip.rootY, baseY: this.imitClip.baseY,
+   468→   468→          }
+   469→   469→        : null;
+   470→   470→      const imitSig = this.imitClip
+   471→   471→        ? `${this.imitClip.name}|${this.imitClip.frames}|${this.imitClip.mapped}`
+   472→   472→        : "";
+   473→   473→      // Trainer wegwerfen, wenn Welt/Imitation/Obs-Layout sich geändert haben
+   474→   474→      if (this.trainer) {
+   475→   475→        const stale =
+   476→   476→          this.trainer.obsExtra !== obsExtra ||
+   477→   477→          this.trainer.world !== this.worldBuild ||
+   478→   478→          this.trainer.imitSig !== imitSig;
+   479→   479→        if (stale) {
+   480→   480→          this.trainer.dispose();
+   481→   481→          this.trainer = null;
+   482→   482→          this.esView = null;
+   483→   483→          this.esObsExtra = 0;
+   484→   484→        }
+   485→   485→      }
+   486→   486→      if (!this.trainer) {
+   487→   487→        const warm = await warmStartMlp(getModel(this.modelId), obsExtra);
+   488→   488→        this.trainer = new EsTrainer(this.modelId, warm.theta, warm.layout, this.rewardCfg!, {
+   489→   489→          obsExtra, world: this.worldBuild, imit: imitData, imitSig,
+   490→   490→        });
+   491→   491→        await this.trainer.init();
+   492→   492→      }
+   493→   493→      this.trainer.setReward(this.rewardCfg!);
+   494→   494→      this.trainer.setTargetPoint(this.pointMode ? ([...this.point] as [number, number]) : null);
+   495→   495→      this.trainingActive = true;
+   496→   496→      this.emit();
+   497→   497→      await this.trainer.tryStartWorkers();
+   498→   498→      if (!this.trainingActive) return; // inzwischen gestoppt
+   499→   499→      void this.trainingLoop();
+   500→   500→    } catch (err: any) {
+   501→   501→      console.error("[core] Training-Start fehlgeschlagen:", err);
+   502→   502→      this.trainingActive = false;
+   503→   503→      this.emit();
+   504→   504→    }
+   505→   505→  }
+   506→   506→
+   507→   507→  stopTraining() {
+   508→   508→    this.trainingActive = false;
+   509→   509→    this.emit();
+   510→   510→  }
+   511→   511→
+   512→   512→  setTurbo(t: TurboLevel) {
+   513→   513→    this.trainer?.setTurbo(t);
+   514→   514→    this.emit();
+   515→   515→  }
+   516→   516→
+   517→   517→  private async trainingLoop() {
+   518→   518→    while (this.trainingActive && this.trainer) {
+   519→   519→      await this.trainer.runGeneration();
+   520→   520→      this.updateEsView();
+   521→   521→      this.emit();
+   522→   522→      await new Promise((r) => setTimeout(r, 30));
+   523→   523→    }
+   524→   524→  }
+   525→   525→
+   526→   526→  private updateEsView() {
+   527→   527→    if (!this.trainer) {
+   528→   528→      this.esView = null;
+   529→   529→      return;
+   530→   530→    }
+   531→   531→    try {
+   532→   532→      this.esView = new MlpPolicy(this.trainer.layout, this.trainer.bestTheta);
+   533→   533→      this.esObsExtra = this.trainer.layout.obsDim - this.trainer.meta.obsDim;
+   534→   534→    } catch {
+   535→   535→      this.esView = null;
+   536→   536→    }
+   537→   537→  }
+   538→   538→
+   539→   539→  /** "Beste zeigen": Quelle auf ES-Policy (bestTheta) umschalten. */
+   540→   540→  showBest() {
+   541→   541→    this.updateEsView();
+   542→   542→    this.source = "es";
+   543→   543→    this.emit();
+   544→   544→  }
+   545→   545→
+   546→   546→  // ── Theta Persistenz ────────────────────────────────────────────────────────
+   547→   547→
+   548→   548→  private thetaKey(): string {
+   549→   549→    return `mdt_v2_theta_${this.modelId}`;
+   550→   550→  }
+   551→   551→
+   552→   552→  async saveTheta(): Promise<boolean> {
+   553→   553→    if (!this.trainer || !this.modelId) return false;
+   554→   554→    try {
+   555→   555→      const t = this.trainer;
+   556→   556→      localStorage.setItem(this.thetaKey(), JSON.stringify({
+   557→   557→        layout: t.layout,
+   558→   558→        theta: Array.from(t.theta),
+   559→   559→        bestTheta: Array.from(t.bestTheta),
+   560→   560→        generation: t.generation,
+   561→   561→        bestEver: t.bestEver,
+   562→   562→        history: t.history.slice(-200),
+   563→   563→      }));
+   564→   564→      return true;
+   565→   565→    } catch {
+   566→   566→      return false;
+   567→   567→    }
+   568→   568→  }
+   569→   569→
+   570→   570→  hasSavedTheta(): boolean {
+   571→   571→    try {
+   572→   572→      return !!localStorage.getItem(this.thetaKey());
+   573→   573→    } catch {
+   574→   574→      return false;
+   575→   575→    }
+   576→   576→  }
+   577→   577→
+   578→   578→  async loadTheta(): Promise<boolean> {
+   579→   579→    if (!this.modelId) return false;
+   580→   580→    try {
+   581→   581→      const raw = localStorage.getItem(this.thetaKey());
+   582→   582→      if (!raw) return false;
+   583→   583→      const d = JSON.parse(raw) as {
+   584→   584→        layout: MlpLayout; theta: number[]; bestTheta: number[];
+   585→   585→        generation: number; bestEver: number; history: number[];
+   586→   586→      };
+   587→   587→      if (!d?.theta?.length || !d?.layout) return false;
+   588→   588→      this.trainingActive = false;
+   589→   589→      this.trainer?.dispose();
+   590→   590→      this.trainer = new EsTrainer(this.modelId, new Float32Array(d.theta), d.layout, this.rewardCfg!);
+   591→   591→      await this.trainer.init();
+   592→   592→      this.trainer.bestTheta = new Float32Array(d.bestTheta ?? d.theta);
+   593→   593→      this.trainer.generation = d.generation ?? 0;
+   594→   594→      this.trainer.bestEver = d.bestEver ?? -Infinity;
+   595→   595→      this.trainer.history = Array.isArray(d.history) ? d.history : [];
+   596→   596→      this.updateEsView();
+   597→   597→      this.emit();
+   598→   598→      return true;
+   599→   599→    } catch (err) {
+   600→   600→      console.warn("[core] Theta-Load fehlgeschlagen:", err);
+   601→   601→      return false;
+   602→   602→    }
+   603→   603→  }
+   604→   604→
+   605→   605→  // ── Kontroll-Loop (50 Hz, async wegen ONNX) ─────────────────────────────────
+   606→   606→
+   607→   607→  private stepMs(): number {
+   608→   608→    const m = this.engine.meta;
+   609→   609→    return m ? m.timestep * m.decimation * 1000 : 20;
+   610→   610→  }
+   611→   611→
+   612→   612→  private async controlLoop() {
+   613→   613→    let next = performance.now();
+   614→   614→    let count = 0;
+   615→   615→    let hzT0 = next;
+   616→   616→    while (this.running) {
+   617→   617→      try {
+   618→   618→        await this.controlStep();
+   619→   619→      } catch (err) {
+   620→   620→        console.warn("[core] controlStep:", err);
+   621→   621→      }
+   622→   622→      count++;
+   623→   623→      const now = performance.now();
+   624→   624→      if (now - hzT0 > 500) {
+   625→   625→        this.ctrlHz = (count * 1000) / (now - hzT0);
+   626→   626→        count = 0;
+   627→   627→        hzT0 = now;
+   628→   628→      }
+   629→   629→      next += this.stepMs();
+   630→   630→      const wait = next - performance.now();
+   631→   631→      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+   632→   632→      else next = performance.now(); // zurückgefallen: nicht spiralen
+   633→   633→    }
+   634→   634→  }
+   635→   635→
+   636→   636→  private async controlStep(): Promise<void> {
+   637→   637→    const engine = this.engine;
+   638→   638→    if (!engine.data || !engine.meta || !this.modelId) return;
+   639→   639→
+   640→   640→    // ── v2.1: Punkt-Modus – Joystick bewegt den 3D-Punkt ──
+   641→   641→    const dtStep = this.stepMs() / 1000;
+   642→   642→    if (this.pointMode) {
+   643→   643→      const sp = 1.4 * dtStep;
+   644→   644→      const lim = arenaHalf(this.modelId) - 0.15;
+   645→   645→      this.point[0] = Math.min(lim, Math.max(-lim, this.point[0] + this.joy.x * sp));
+   646→   646→      this.point[1] = Math.min(lim, Math.max(-lim, this.point[1] + this.joy.y * sp));
+   647→   647→      engine.targetPoint = [this.point[0], this.point[1]];
+   648→   648→      this.trainer?.setTargetPoint([this.point[0], this.point[1]]);
+   649→   649→      this.world?.setTargetPoint(this.point[0], this.point[1], true);
+   650→   650→    } else if (engine.targetPoint) {
+   651→   651→      engine.targetPoint = null;
+   652→   652→      this.world?.setTargetPoint(0, 0, false);
+   653→   653→    }
+   654→   654→
+   655→   655→    // ── v2.1: Imitation – Zielpose je Policy-Step ──
+   656→   656→    if (this.imitClip && this.imitPlaying && this.imitTargetBuf) {
+   657→   657→      this.imitTime += dtStep;
+   658→   658→      targetAt(this.imitClip, this.imitTime, this.imitTargetBuf);
+   659→   659→      engine.imitTarget = this.imitTargetBuf;
+   660→   660→      engine.imitRootDelta = rootDeltaAt(this.imitClip, this.imitTime);
+   661→   661→      const ph = this.imitClip.duration > 0
+   662→   662→        ? ((this.imitTime % this.imitClip.duration) / this.imitClip.duration) * 2 * Math.PI
+   663→   663→        : 0;
+   664→   664→      engine.imitPhase = [Math.sin(ph), Math.cos(ph)];
+   665→   665→    }
+   666→   666→
+   667→   667→    if (this.recovering) {
+   668→   668→      this.stepRecovery();
+   669→   669→    } else if (this.modelId === "microduck") {
+   670→   670→      await this.stepDuck();
+   671→   671→    } else {
+   672→   672→      this.stepG1();
+   673→   673→    }
+   674→   674→    if (!engine.data) return; // Modellwechsel während des Steps (dispose)
+   675→   675→
+   676→   676→    // Auto-Recovery nur im Test-Modus (Zustand läuft physisch weiter)
+   677→   677→    if (this.mode === "test" && this.autoRecovery && !this.recovering && engine.isFallen()) {
+   678→   678→      if (++this.fallDebounce >= 10) this.startRecovery();
+   679→   679→    } else if (!this.recovering) {
+   680→   680→      this.fallDebounce = 0;
+   681→   681→    }
+   682→   682→
+   683→   683→    if (this.mode === "test") {
+   684→   684→      this.testUptime = (performance.now() - this.testStart) / 1000;
+   685→   685→    }
+   686→   686→  }
+   687→   687→
+   688→   688→  // ── Enten-Step (cmd + ONNX/ES-Policy) ───────────────────────────────────────
+   689→   689→
+   690→   690→  private async stepDuck(): Promise<void> {
+   691→   691→    const engine = this.engine;
+   692→   692→    const meta = engine.meta;
+   693→   693→
+   694→   694→    // Command-Slots: Punkt-Modus → Richtung zum Punkt; sonst Mappings/Test
+   695→   695→    if (this.pointMode && engine.targetPoint) {
+   696→   696→      const [tx, ty] = engine.targetPoint;
+   697→   697→      const p = engine.torsoPos();
+   698→   698→      const dx = tx - p[0], dy = ty - p[1];
+   699→   699→      const dist = Math.hypot(dx, dy);
+   700→   700→      const yaw = engine.yaw();
+   701→   701→      const fwd = Math.cos(yaw) * dx + Math.sin(yaw) * dy;
+   702→   702→      const lat = -Math.sin(yaw) * dx + Math.cos(yaw) * dy;
+   703→   703→      const desired = Math.atan2(dy, dx);
+   704→   704→      let yerr = desired - yaw;
+   705→   705→      while (yerr > Math.PI) yerr -= 2 * Math.PI;
+   706→   706→      while (yerr < -Math.PI) yerr += 2 * Math.PI;
+   707→   707→      if (dist > 0.12) {
+   708→   708→        engine.cmd[0] = clamp(VEL_FWD * 0.9 * Math.max(0, Math.cos(yerr)), VEL_BACK, VEL_FWD);
+   709→   709→        engine.cmd[1] = clamp(lat * 1.2, -VEL_LAT, VEL_LAT);
+   710→   710→        engine.cmd[2] = clamp(1.4 * yerr, -VEL_ANG, VEL_ANG);
+   711→   711→      } else {
+   712→   712→        engine.cmd[0] = 0; engine.cmd[1] = 0; engine.cmd[2] = 0;
+   713→   713→      }
+   714→   714→    } else {
+   715→   715→      let vx = 0, vy = 0, wz = 0;
+   716→   716→      if (this.mode !== "test") {
+   717→   717→        for (const m of this.mappings) {
+   718→   718→          if (m.targetType !== "cmd") continue;
+   719→   719→          const v = (m.source === "joyX" ? this.joy.x : this.joy.y) * m.gain;
+   720→   720→          if (m.target === "cmd_x") vx += v;
+   721→   721→          else if (m.target === "cmd_y") vy += v;
+   722→   722→          else if (m.target === "cmd_yaw") wz -= v; // Stick rechts = Rechtsdrehung
+   723→   723→        }
+   724→   724→      }
+   725→   725→      engine.cmd[0] = clamp(vx, VEL_BACK, VEL_FWD);
+   726→   726→      engine.cmd[1] = clamp(vy, -VEL_LAT, VEL_LAT);
+   727→   727→      engine.cmd[2] = clamp(wz, -VEL_ANG, VEL_ANG);
+   728→   728→    }
+   729→   729→
+   730→   730→    // Button-Trigger (Edge)
+   731→   731→    if (this.pendingPolicyId) {
+   732→   732→      this.overridePolicy = this.pendingPolicyId;
+   733→   733→      this.pendingPolicyId = null;
+   734→   734→    }
+   735→   735→    if (this.pendingPoseId) {
+   736→   736→      const pose = poseById("microduck", this.pendingPoseId);
+   737→   737→      this.pendingPoseId = null;
+   738→   738→      if (pose) this.startDuckPose(pose.targets);
+   739→   739→    }
+   740→   740→
+   741→   741→    // v2.1: Imitation manuell anwenden (Zielpose direkt als ctrl)
+   742→   742→    if (this.mode === "manuell" && this.imitManual && this.imitClip && this.imitPlaying && this.imitTargetBuf) {
+   743→   743→      engine.applyCtrlFromPose(this.imitTargetBuf);
+   744→   744→      engine.stepPhysics();
+   745→   745→      return;
+   746→   746→    }
+   747→   747→
+   748→   748→    // Pose-Hold (kurze Overlay-Phase, dann zurück zur Policy)
+   749→   749→    if (this.duckPoseHold) {
+   750→   750→      const hold = this.duckPoseHold;
+   751→   751→      const now = performance.now();
+   752→   752→      const u = clamp((now - hold.t0) / hold.blendMs, 0, 1);
+   753→   753→      const ctrl = engine.data.ctrl as Float32Array;
+   754→   754→      for (let j = 0; j < meta.actionDim; j++) {
+   755→   755→        ctrl[j] = hold.from[j] + (hold.to[j] - hold.from[j]) * u;
+   756→   756→      }
+   757→   757→      engine.stepPhysics();
+   758→   758→      if (now - hold.t0 > hold.blendMs + hold.holdMs) {
+   759→   759→        this.duckPoseHold = null;
+   760→   760→        engine.lastAction.fill(0);
+   761→   761→      }
+   762→   762→      return;
+   763→   763→    }
+   764→   764→
+   765→   765→    // Policy wählen
+   766→   766→    let policy: OnnxPolicy | MlpPolicy | null = null;
+   767→   767→    if (this.source === "es" && this.esView) {
+   768→   768→      policy = this.esView;
+   769→   769→    } else {
+   770→   770→      const id = this.overridePolicy ?? this.selectedOnnx;
+   771→   771→      policy = (await this.getOnnxSession(id)) ?? (await this.getOnnxSession(meta.defaultOnnx));
+   772→   772→      if (!engine.data) return; // Modellwechsel während des Session-Ladens
+   773→   773→    }
+   774→   774→    if (!policy) {
+   775→   775→      engine.stepPhysics();
+   776→   776→      return;
+   777→   777→    }
+   778→   778→
+   779→   779→    // ONNX braucht exakte Basis-Dimension; ES-MLP ggf. +2 (Imitations-Phase)
+   780→   780→    const obs = policy instanceof MlpPolicy
+   781→   781→      ? engine.obsFor(this.esObsExtra >= 2)
+   782→   782→      : engine.obsFor(false);
+   783→   783→    const act = policy instanceof MlpPolicy
+   784→   784→      ? policy.forward(obs, this.actBuf)
+   785→   785→      : await policy.forward(obs);
+   786→   786→    this.actBuf.fill(0);
+   787→   787→    this.actBuf.set(act.subarray(0, Math.min(act.length, this.actBuf.length)));
+   788→   788→    engine.lastAction.set(this.actBuf);
+   789→   789→    engine.stepWithAction(this.actBuf);
+   790→   790→
+   791→   791→    if (this.mode === "test") {
+   792→   792→      this.testReward += stepRewardValue(engine, this.rewardCfg!, this.actBuf, this.prevAct);
+   793→   793→      this.prevAct.set(this.actBuf);
+   794→   794→    }
+   795→   795→  }
+   796→   796→
+   797→   797→  private startDuckPose(targets: Record<string, number>) {
+   798→   798→    const meta = this.engine.meta;
+   799→   799→    const from = new Float32Array(this.engine.data.ctrl as Float32Array);
+   800→   800→    const to = new Float32Array(meta.actionDim);
+   801→   801→    for (let j = 0; j < meta.actionDim; j++) {
+   802→   802→      const name = meta.jointNames[j];
+   803→   803→      to[j] = targets[name] ?? meta.defaultPose[j];
+   804→   804→    }
+   805→   805→    this.duckPoseHold = { from, to, t0: performance.now(), blendMs: 400, holdMs: 1600 };
+   806→   806→  }
+   807→   807→
+   808→   808→  // ── G1-Step (direkte Gelenk-Targets / ES-Policy) ────────────────────────────
+   809→   809→
+   810→   810→  private stepG1(): void {
+   811→   811→    const engine = this.engine;
+   812→   812→    const meta = engine.meta;
+   813→   813→    const dim = meta.actionDim;
+   814→   814→
+   815→   815→    // Pose-Trigger (Edge)
+   816→   816→    if (this.pendingPoseId) {
+   817→   817→      const pose = poseById("unitree_g1", this.pendingPoseId);
+   818→   818→      this.pendingPoseId = null;
+   819→   819→      if (pose) this.startG1Blend(pose.targets);
+   820→   820→    }
+   821→   821→
+   822→   822→    // Basis-Blending (0.4 s)
+   823→   823→    if (this.g1Blend && this.g1Base) {
+   824→   824→      const b = this.g1Blend;
+   825→   825→      const u = clamp((performance.now() - b.t0) / b.dur, 0, 1);
+   826→   826→      const e = u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
+   827→   827→      for (let j = 0; j < dim; j++) this.g1Base[j] = b.from[j] + (b.to[j] - b.from[j]) * e;
+   828→   828→      if (u >= 1) this.g1Blend = null;
+   829→   829→    }
+   830→   830→
+   831→   831→    if (this.mode === "manuell") {
+   832→   832→      // Joystick-Offsets auf gemappten Gelenken
+   833→   833→      const targets = new Float32Array(dim);
+   834→   834→      targets.set(this.g1Base ?? engine.standPose);
+   835→   835→      for (const m of this.mappings) {
+   836→   836→        if (m.targetType !== "gelenk") continue;
+   837→   837→        const v = (m.source === "joyX" ? this.joy.x : this.joy.y) * m.gain;
+   838→   838→        for (const jn of m.target.split(",").map((s) => s.trim())) {
+   839→   839→          const idx = meta.jointNames.indexOf(jn);
+   840→   840→          if (idx >= 0) targets[idx] += v;
+   841→   841→        }
+   842→   842→      }
+   843→   843→      engine.applyCtrlFromPose(targets);
+   844→   844→      engine.stepPhysics();
+   845→   845→      return;
+   846→   846→    }
+   847→   847→
+   848→   848→    // v2.1: Punkt-Modus – cmd Richtung Punkt (für ES-Obs)
+   849→   849→    if (this.pointMode && engine.targetPoint) {
+   850→   850→      const [tx, ty] = engine.targetPoint;
+   851→   851→      const p = engine.torsoPos();
+   852→   852→      const dx = tx - p[0], dy = ty - p[1];
+   853→   853→      const dist = Math.hypot(dx, dy);
+   854→   854→      const yaw = engine.yaw();
+   855→   855→      const desired = Math.atan2(dy, dx);
+   856→   856→      let yerr = desired - yaw;
+   857→   857→      while (yerr > Math.PI) yerr -= 2 * Math.PI;
+   858→   858→      while (yerr < -Math.PI) yerr += 2 * Math.PI;
+   859→   859→      engine.cmd[0] = dist > 0.15 ? 0.35 * Math.max(0, Math.cos(yerr)) : 0;
+   860→   860→      engine.cmd[2] = clamp(1.2 * yerr, -1, 1);
+   861→   861→    }
+   862→   862→
+   863→   863→    // Training/Test: ES-Policy (G1 hat keine ONNX-Policies)
+   864→   864→    const mlp = this.esView;
+   865→   865→    if (!mlp || !this.g1Base) {
+   866→   866→      // noch nichts trainiert: Stand-Pose halten, Physik läuft weiter
+   867→   867→      engine.applyCtrlFromPose(engine.standPose);
+   868→   868→      engine.stepPhysics();
+   869→   869→      return;
+   870→   870→    }
+   871→   871→    const obs = engine.obsFor(this.esObsExtra >= 2);
+   872→   872→    const act = mlp.forward(obs, this.actBuf);
+   873→   873→    engine.lastAction.set(act);
+   874→   874→    engine.stepWithAction(act);
+   875→   875→    if (this.mode === "test") {
+   876→   876→      this.testReward += stepRewardValue(engine, this.rewardCfg!, act, this.prevAct);
+   877→   877→      this.prevAct.set(act);
+   878→   878→    }
+   879→   879→  }
+   880→   880→
+   881→   881→  private startG1Blend(targets: Record<string, number>) {
+   882→   882→    const meta = this.engine.meta;
+   883→   883→    const to = new Float32Array(meta.actionDim);
+   884→   884→    for (let j = 0; j < meta.actionDim; j++) {
+   885→   885→      to[j] = targets[meta.jointNames[j]] ?? this.engine.standPose[j];
+   886→   886→    }
+   887→   887→    this.g1Blend = { from: (this.g1Base ?? this.engine.standPose).slice(), to, t0: performance.now(), dur: 400 };
+   888→   888→  }
+   889→   889→
+   890→   890→  // ── Auto-Recovery (sanftes Blenden zur Stand-Pose, kein Teleport) ───────────
+   891→   891→
+   892→   892→  private startRecovery() {
+   893→   893→    this.recovering = true;
+   894→   894→    this.recoverySteps = 0;
+   895→   895→    this.recoveryUpright = 0;
+   896→   896→    this.fallDebounce = 0;
+   897→   897→    this.engine.lastAction.fill(0);
+   898→   898→    this.emit();
+   899→   899→  }
+   900→   900→
+   901→   901→  private stepRecovery() {
+   902→   902→    const engine = this.engine;
+   903→   903→    const meta = engine.meta;
+   904→   904→    const stand = meta.id === "microduck" ? Float32Array.from(meta.defaultPose) : engine.standPose;
+   905→   905→    const ctrl = engine.data.ctrl as Float32Array;
+   906→   906→    for (let j = 0; j < meta.actionDim; j++) {
+   907→   907→      ctrl[j] += (stand[j] - ctrl[j]) * 0.06; // sanft, pro Policy-Step
+   908→   908→    }
+   909→   909→    engine.stepPhysics();
+   910→   910→    this.recoverySteps++;
+   911→   911→    const upright = engine.projGravZ() < -0.85 && !engine.isFallen();
+   912→   912→    this.recoveryUpright = upright ? this.recoveryUpright + 1 : 0;
+   913→   913→    if (this.recoveryUpright >= 50) {
+   914→   914→      // 1 s aufrecht → Policy übernimmt wieder (Zustand läuft weiter)
+   915→   915→      this.recovering = false;
+   916→   916→      this.recoveryUpright = 0;
+   917→   917→      engine.lastAction.fill(0);
+   918→   918→      this.prevAct.fill(0);
+   919→   919→      this.emit();
+   920→   920→    }
+   921→   921→  }
+   922→   922→
+   923→   923→  // ── Render-Loop (rAF) ───────────────────────────────────────────────────────
+   924→   924→
+   925→   925→  private renderLoop = () => {
+   926→   926→    if (!this.running || !this.world) return;
+   927→   927→    const now = performance.now();
+   928→   928→    const dt = Math.min(0.05, (now - this.lastFrameT) / 1000 || 0.016);
+   929→   929→    this.lastFrameT = now;
+   930→   930→    const engine = this.engine;
+   931→   931→    if (engine.data && engine.meta) {
+   932→   932→      const [x, y, z] = engine.torsoPos();
+   933→   933→      this.world.setCameraTarget(x, z, -y);
+   934→   934→      if (engine.meta.id === "microduck") {
+   935→   935→        syncDuck(this.world, engine);
+   936→   936→      } else {
+   937→   937→        syncG1(this.world, engine, engine.mujoco);
+   938→   938→      }
+   939→   939→      syncBall(this.world, engine);
+   940→   940→      this.world.updateCamera(dt);
+   941→   941→      this.world.renderer.render(this.world.scene, this.world.camera);
+   942→   942→    }
+   943→   943→    if (now - this.lastEmit > 250) {
+   944→   944→      this.lastEmit = now;
+   945→   945→      this.emit();
+   946→   946→    }
+   947→   947→    requestAnimationFrame(this.renderLoop);
+   948→   948→  };
+   949→   949→
+   950→   950→  // ── Telemetrie ──────────────────────────────────────────────────────────────
+   951→   951→
+   952→   952→  private emit() {
+   953→   953→    const engine = this.engine;
+   954→   954→    const qvel = engine.data ? (engine.data.qvel as Float32Array) : null;
+   955→   955→    const t: Telemetry = {
+   956→   956→      booted: this.booted,
+   957→   957→      loading: this.loading,
+   958→   958→      loadingText: this.loadingText,
+   959→   959→      error: this.error,
+   960→   960→      modelId: this.modelId,
+   961→   961→      mode: this.mode,
+   962→   962→      source: this.source,
+   963→   963→      onnxId: this.selectedOnnx,
+   964→   964→      overridePolicy: this.overridePolicy,
+   965→   965→      esReady: this.esView !== null,
+   966→   966→      speed: qvel ? Math.hypot(qvel[0], qvel[1]) : 0,
+   967→   967→      height: engine.data ? engine.height() : 0,
+   968→   968→      ctrlHz: Math.round(this.ctrlHz),
+   969→   969→      recovering: this.recovering,
+   970→   970→      fallen: engine.data ? engine.isFallen() : false,
+   971→   971→      testUptime: this.testUptime,
+   972→   972→      testReward: this.testReward,
+   973→   973→      training: this.trainingActive,
+   974→   974→      es: this.trainer ? this.trainer.stats() : null,
+   975→   975→      mappings: this.mappings,
+   976→   976→      reward: this.rewardCfg ?? (this.modelId ? loadRewardConfig(this.modelId) : ({} as RewardConfig)),
+   977→   977→      world: this.worldCfg,
+   978→   978→      pointMode: this.pointMode,
+   979→   979→      point: [this.point[0], this.point[1]],
+   980→   980→      imitation: this.imitClip
+   981→   981→        ? {
+   982→   982→            name: this.imitClip.name, duration: this.imitClip.duration,
+   983→   983→            playing: this.imitPlaying, time: this.imitTime,
+   984→   984→            mapped: this.imitClip.mapped, manual: this.imitManual,
+   985→   985→          }
+   986→   986→        : null,
+   987→   987→    };
+   988→   988→    try {
+   989→   989→      this.onTelemetry(t);
+   990→   990→    } catch {
+   991→   991→      // UI-Fehler dürfen die Sim nicht abwürgen
+   992→   992→    }
+   993→   993→  }
+   994→   994→
+   995→   995→  get isTraining(): boolean {
+   996→   996→    return this.trainingActive;
+   997→   997→  }
+   998→   998→
+   999→   999→  // ── Vollbild ────────────────────────────────────────────────────────────────
+  1000→  1000→
+  1001→  1001→  static async toggleFullscreen(el: HTMLElement): Promise<void> {
+  1002→  1002→    const doc = document as Document & {
+  1003→  1003→      webkitFullscreenElement?: Element;
+  1004→  1004→      webkitExitFullscreen?: () => Promise<void>;
+  1005→  1005→    };
+  1006→  1006→    const full = el as HTMLElement & { webkitRequestFullscreen?: () => Promise<void> };
+  1007→  1007→    const active = document.fullscreenElement ?? doc.webkitFullscreenElement;
+  1008→  1008→    try {
+  1009→  1009→      if (active) {
+  1010→  1010→        if (document.exitFullscreen) await document.exitFullscreen();
+  1011→  1011→        else await doc.webkitExitFullscreen?.();
+  1012→  1012→        return;
+  1013→  1013→      }
+  1014→  1014→      if (el.requestFullscreen) await el.requestFullscreen();
+  1015→  1015→      else if (full.webkitRequestFullscreen) await full.webkitRequestFullscreen();
+  1016→  1016→      const orientation = screen.orientation as ScreenOrientation & {
+  1017→  1017→        lock?: (o: string) => Promise<void>;
+  1018→  1018→      };
+  1019→  1019→      await orientation?.lock?.("landscape")?.catch?.(() => {});
+  1020→  1020→    } catch {
+  1021→  1021→      // Vollbild/Rotation verweigert (z. B. iOS Safari) – ignorieren
+  1022→  1022→    }
+  1023→  1023→  }
+  1024→  1024→
+  1025→  1025→  // ── Aufräumen ───────────────────────────────────────────────────────────────
+  1026→  1026→
+  1027→  1027→  dispose() {
+  1028→  1028→    this.running = false;
+  1029→  1029→    this.trainingActive = false;
+  1030→  1030→    this.trainer?.dispose();
+  1031→  1031→    this.trainer = null;
+  1032→  1032→    this.engine.dispose();
+  1033→  1033→    this.world?.dispose();
+  1034→  1034→    this.world = null;
+  1035→  1035→    this.booted = false;
+  1036→  1036→  }
+  1037→  1037→}
+  1038→  1038→
+  1039→  1039→// ── v2.1: Persistenz (Welt + Punkt-Modus) ────────────────────────────────────
+  1040→  1040→
+  1041→  1041→function loadWorldPrefs(): WorldConfig {
+  1042→  1042→  try {
+  1043→  1043→    const raw = localStorage.getItem("mdt_v2_world");
+  1044→  1044→    if (raw) {
+  1045→  1045→      const p = JSON.parse(raw) as WorldConfig;
+  1046→  1046→      if (p && typeof p.seed === "number") {
+  1047→  1047→        return { ...defaultWorldConfig(), ...p, features: { ...defaultWorldConfig().features, ...p.features } };
+  1048→  1048→      }
+  1049→  1049→    }
+  1050→  1050→  } catch { /* ignore */ }
+  1051→  1051→  return defaultWorldConfig();
+  1052→  1052→}
+  1053→  1053→
+  1054→  1054→function saveWorldPrefs(cfg: WorldConfig): void {
+  1055→  1055→  try { localStorage.setItem("mdt_v2_world", JSON.stringify(cfg)); } catch { /* ignore */ }
+  1056→  1056→}
+  1057→  1057→
+  1058→  1058→function loadPointPrefs(modelId: ModelId): boolean {
+  1059→  1059→  try { return localStorage.getItem(`mdt_v2_point_${modelId}`) === "1"; } catch { return false; }
+  1060→  1060→}
+  1061→  1061→
+  1062→  1062→function savePointPrefs(modelId: ModelId, on: boolean): void {
+  1063→  1063→  try { localStorage.setItem(`mdt_v2_point_${modelId}`, on ? "1" : "0"); } catch { /* ignore */ }
+  1064→  1064→}
+  1065→  1065→
+  1066→  1066→export default TrainerCore;
+  1067→  1067→

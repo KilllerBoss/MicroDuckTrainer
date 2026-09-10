@@ -75,3 +75,30 @@ Work Log:
 Stage Summary:
 - Direkter Download: https://github.com/KilllerBoss/MicroDuckTrainer/releases/download/v2.0.0/MicroDuckTrainer-v2.0.apk
 - Release-Seite: https://github.com/KilllerBoss/MicroDuckTrainer/releases/tag/v2.0.0
+
+---
+Task ID: 6
+Agent: main (Super Z)
+Task: Nutzer-Feedback umsetzen – kamera-relativer Joystick-Punkt, Punkt-Modi (Aus/Frei/Umkreis/Pfad mit Momentum), Distanz→Tempo, Gemini-Standard-Key
+
+Work Log:
+- rig.ts: World.getCamYaw() (Kamera-Gierwinkel für kamera-relative Steuerung) + World.setTargetPath() (orange Pfad-Trail-Linie, 256 Punkte)
+- app-core.ts: PointCfg-Typ { mode: aus|frei|umkreis|pfad, radius, speedByDist, maxSpeed, fullDist } mit Persistenz (mdt_v2_pointcfg_<model>, Migration vom alten Boolean-Pref)
+  * Kamera-relativ: vorne = (-cos camYaw, +sin camYaw) im MuJoCo-Frame, rechts = (f_y, -f_x) – verifiziert: Δy/Δx ≈ -0,69 bei camYaw 0,6 (vorher: Welt-Norden)
+  * umkreis/pfad: Punkt wird auf Radius um Roboter geklemmt (Leash) – Test: dist 0,999 ≤ 1,0
+  * pfad: Feder-Dämpfer-Führpunkt (k=16, ζ=0,8, vmax=2,5×maxSpeed) mit Momentum + Trail ~10 Hz – Test: Drift 0,05 m nach Joystick-Release, Trail sichtbar
+  * Distanz→Tempo: cmd_x = maxSpeed · clamp(dist/fullDist, 0,15, 1) · cos(yerr) – Test: nah 0,145 vs. fern 0,177
+  * markerShown-Flag gegen zurückgebliebenen Punkt-Marker beim Modellwechsel
+- ControlPanel.tsx: Segment-Buttons Aus/Frei/Umkreis/Pfad + Slider (Umkreis-Radius 0,3–6 m, Max-Tempo, Volldistanz) + Distanz→Tempo-Switch
+- gemini.ts: DEFAULT_GEMINI_KEY eingebaut (Nutzer-Key), GeminiPatch.point {mode,radius,speedByDist,maxSpeed,fullDist} + Prompt/Parser erweitert, klare Fehlermeldungen (Standort nicht unterstützt / Key ungültig)
+- GeminiPanel.tsx: Standard-Key-Hinweis, Punkt-Patch-Anwendung
+- Sandbox-HK: Gemini-API blockt Standort (FAILED_PRECONDITION) – Key selbst plausibel gültig (kein API_KEY_INVALID); auf Nutzer-Gerät (DE) erwartet funktional
+- QA (agent-browser): Boot clean, 4 Segmente + 2 Slider, Persistenz nach Reload, Screenshot mit Trail + Welt-Objekten
+- Build: lint 0 Fehler, Export OK, APK v2.1 (versionCode 3, 39,6 MB, gleiche Signatur wie v2.0 → Update ohne Deinstallation), Badging/Align/Signatur verifiziert
+- GitHub: Commit b2a1db6 gepusht, Release v2.1.0 erstellt, APK als Asset hochgeladen, Download verifiziert (HTTP 206, PK-Magic)
+
+Stage Summary:
+- Download: https://github.com/KilllerBoss/MicroDuckTrainer/releases/download/v2.1.0/MicroDuckTrainer-v2.1.apk
+- Release: https://github.com/KilllerBoss/MicroDuckTrainer/releases/tag/v2.1.0
+- v2.1 direkt über v2.0 installierbar (gleiche Signatur); nur v1.0-Nutzer müssen deinstallieren
+- Gemini-Key liegt eingebaut in der App; Hinweis auf Länder-/Netz-Sperre in Fehlermeldung + README
