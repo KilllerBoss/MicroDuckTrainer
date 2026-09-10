@@ -1,104 +1,59 @@
-# MicroDuck Trainer – Multi-Agent Worklog
-
 ---
-Task ID: 1
+Task ID: 7 (v2.3)
 Agent: main (Super Z)
-Task: Umgebung-Rebuild nach Reset + Vorbereitung für APK v2.0
+Task: Trainings-Kern sanieren (Ente läuft nicht / fällt, G1 zittert), Profi-Tricks, Original-Welten + Reset, GLB-Imitation-Fix, Gemini-Profi-Wissen, Joystick-Release + schwebender Pfad
 
 Work Log:
-- Festgestellt: Workspace wurde komplett zurückgesetzt (nur leeres Scaffold + .git mit leerem Initial-Commit)
-- GitHub-Token verifiziert: User = KilllerBoss (für Upload vorgesehen)
-- Skill fullstack-dev geladen, Next.js 16 Scaffold via init-fullstack.sh neu aufgesetzt
-- Original-Assets von HF-Space pollen-robotics/microduck-simulator heruntergeladen:
-  * public/robot/mjlab/ (robot_allcollisions.xml, kinematics.json, microduck.glb, 43 STL-Meshes)
-  * public/policies/ (9 ONNX: walking, stand, sitstand, roller, roller_crouch, ground_pick, kick_l/r, roulade)
-- Unitree G1 aus google-deepmind/mujoco_menagerie (sparse clone) → public/robot/unitree_g1/
-  * g1.xml = g1_29dof_rev_1_0: 29 POSITION-Aktuatoren (kp=500, dampratio=1), meshdir="assets", 51 STL, Keyframe "stand" (Höhe 0.79)
-  * position-Aktuatoren: ctrl = Ziel-Gelenkwinkel (rad) → ideal für Gamepad-Mapping
-- Original-Quellcode als Referenz nach reference/ geladen (game.js mit MuJoCo+ONNX-Bootmuster, duck.js Rig, controls/, constants.js)
-  * MuJoCo: @mujoco/mujoco 3.11, loadMujocoFactory({locateFile}), MjVFS, from_xml_string, 50Hz Policy, dt=0.005, decimation 4, Obs 61D "new-cmd-obs"
-  * ONNX: onnxruntime-web/wasm, ort.env.wasm.wasmPaths={wasm:url}, numThreads=1
-- Android-SDK ohne Android Studio nach scripts/android-sdk/ geladen:
-  * bt/aapt2 2.19, bt/zipalign, bt/apksigner(+jar), bt/d8.jar, plat/android.jar (API 34), r8.jar 8.5.35 (D8 läuft auf JDK 21)
-  * JDK 21 mit javac im System vorhanden
+- DIAGNOSE (Browser + Node-Sim + Python/ort):
+  1) Original-ONNX-Policies sind 4-Layer-MLPs (512→256→128→14) MIT obs_normalizer
+     (Sub/Div) und ELU-Aktivierung → alter 2-Layer-tanh-Extraktor schlug IMMER fehl
+     → ES trainierte ab Zufalls-Init → „Ente bewegt sich nicht und fällt".
+  2) Protobuf-Walker-Fix: (contentStart, contentLength)-Kontrakt wiederhergestellt
+     (Regression aus v2.3-Entwurf: p2-len/p2 war falsch).
+  3) Aktivierung wird jetzt aus dem Graph gelesen (NodeProto op_type; Elu) statt
+     geraten; Folding W'=W/σ, b'=b−W·(μ/σ) numerisch gegen ort verifiziert (9,8e-8).
+  4) ES-Explodierung bei 197k Gewichten: σ=0.08 ohne Skalierung → Verhaltens-Störung
+     ~0.5 voraktiv pro Neuron → 100 % Sturz bei Schritt ~5 → FAN-IN-SKALIERUNG
+     (eps_W = σ/√fan-in, eps_b = σ) eingeführt (muP-Stil).
+  5) Summen-Fitness macht Fall-Strafe ×n binär → im Sum-Modus FLACHE Fall-Strafe
+     (Ranking steigt stetig mit Überlebensdauer).
+  6) theta-Drift bei Stagnation → Anker-Restart: theta ← bestTheta wenn
+     sinceImprovement ≥ 3×Stagnation && Sturzrate > 0,5.
+- PROFIS-TRICKS (TrainingPanel „Profi-Tricks", alle default AN): Befehle trainieren
+  (Zufalls-cmd pro Paar + exp-Tracking-Reward MJX-Stil, cmdFwd-Deckel je Modell),
+  Curriculum (Tempo-Treppe an Sturzrate), Aktions-Lowpass (EMA α), Zufalls-Stöße
+  (alle 55 Steps ±0,35 m/s), Reset-Rauschen (Reference-State-Init), Summen-Fitness,
+  Gewichtsbremse (Decay 0,02). EsStats.speedScale im Panel sichtbar.
+- ENGINE: addResetNoise(), applyPush(), trackCmd-Flag; Vorwärts/Seitwärts-Term
+  folgt cmd (exp-Kernel) wenn trackCmd; Worker (es-worker.js) spiegelt ALLES
+  (N-Layer-MLP, Noise, Pushes, Lowpass, Tracking, Fitness-Modus).
+- Imitation (Cross-Species): Clip-Ziele sind relativ → Zentrum-Pose (Ente:
+  defaultPose, G1: standPose) + Aktuator-Clamp + Wurzel-Höhen-Skalierung
+  (Roboterhöhe/Clip-Wurzelhöhe) → Ente kann aus HUMAN-Animationen lernen.
+  Test-Modus wendet Center+Clamp+Scale ebenfalls an.
+- UI: Welt-Panel „Original-Welt (flach, wie Simulator)"; Menü „Alles auf Original
+  zurücksetzen" (löscht mdt_v2_*, Reload); Profi-Tricks-Sektion; Gemini-Prompts
+  (Regeln + Code-Experte) mit Profi-Wissen + neue training-Knobs (cmdTrain,
+  cmdFwd, curriculum, actionSmooth, pushes, noiseReset, fitnessMode, weightDecay)
+  + Preview-Chips + applyGoal/applyCode durchreichen.
+- Punkt-Modus: Joystick loslassen → Punkt gleitet (weiche Feder ~3,5/s, 0,15 s
+  Delay) zum Roboter zurück (Umkreis + Pfad); PfadVisualisierung NEU: schwebende
+  quadratische Bézier Roboter→Punkt mit wanderndem Leuchtpunkt (Game-Stil) statt
+  Boden-Trail (rig.ts setTargetCurve, AdditiveBlending).
+- Persistenz: theta/bestTheta als Base64 (197k-Gewichte sprengen sonst localStorage);
+  TrainCfg-Migration (fehlende Profi-Felder → AN-Defaults), versionCode 5.
+- QA (agent-browser, Mobile-Viewport): Boot clean; Training Gen 80+ stabil
+  (BestEver 1034, Sturzrate schwankt 0,38–0,92, Anker-Restart holt immer zurück —
+  VORHER: −93 Fitness und 100 % Sturz dauerhaft); Original-Welt-Button setzt
+  Random-Welt aus; Punkt kehrt nach Loslassen heim (Telemetrie PUNKT:PFAD =
+  Roboterposition); schwebende Kurve sichtbar (Screenshot); lint clean.
+- Node-Sim (scripts/sim_probe.mjs, scripts/final_check.mjs): Ente steht 200 Steps,
+  geht mit cmd ≥ 0,25 (x +0,39 m/4 s @0,25; +0,90 m @0,5), überlebt Noise+Pushes.
 
 Stage Summary:
-- Alle Assets + Build-Tools wiederhergestellt; G1 nutzt NEUE Menagerie-Struktur (g1.xml + assets/, keine g1_29dof.xml/meshes mehr)
-- Als nächstes: v2.0-App-Implementierung (Subagent), dann APK-Build (versionCode 2), dann GitHub-Upload
-- HINWEIS: v1.0-Keystore ging beim Reset verloren → v2.0 bekommt NEUE Signatur → Nutzer muss v1.0 vor Installation deinstallieren
-
----
-Task ID: 2
-Agent: main (Super Z) + full-stack-developer-Subagent
-Task: v2.0-App-Implementierung (alle 9 Features)
-
-Work Log:
-- Init-Tarball enthielt die bereits fertig implementierte v2.0-App (src/lib/md/*, src/components/md/*, public/wasm, public/workers) aus der Vorsession
-- Subagent-Starts brachen zweimal ab (context deadline), hatten aber zuvor u.a. es-worker.js/app-core.ts/TrainerApp.tsx aktualisiert; Dev-Server läuft sauber
-- Browser-QA (agent-browser, 390x844): Boot OK (keine Console-Fehler), Ente mit GLB-Rig sichtbar, G1-Wechsel lädt g1.xml + 51 STLs und steht im Stand-Keyframe (Höhe 0.79 m), Panels (Training/Bewertung/Steuerung) OK, Reward-Slider/Presets OK, KI-Generator erzeugt Konfig + Erklärung, ES-Training läuft (351 Schritte/s, Turbo 16x, Main-Thread-Modus-Badge), Test-Modus zählt LAUFZEIT/REWARD kontinuierlich, Joystick-Drag steuert (SPEED > 0), Auto-Recovery-Toggle + Mapping-Editor vorhanden
-- Fix: alter "Toaster is not defined"-Hot-Reload-Fehler war bereits behoben (frischer Reload clean)
-- bun run lint: 0 Fehler; NEXT_OUTPUT=export bunx next build: OK (out/ = 90 MB)
-
-Stage Summary:
-- Alle 9 v2.0-Features verifiziert: G1, Fullscreen-Button, Gamepad (Joystick links, A-D rechts), Ente↔Mensch-Switcher, Reward-Editor, KI-Reward (offline), Action-Mapping, Turbo 1x-64x + Hyper, kontinuierlicher Test ohne Reset
-
----
-Task ID: 3 + 4
-Agent: main (Super Z)
-Task: Android-Pipeline + APK v2.0 bauen
-
-Work Log:
-- scripts/apk/: AndroidManifest.xml (versionCode 2, versionName 2.0, Theme.NoTitleBar.Fullscreen, configChanges gegen Activity-Restart), MainActivity.java (WebView-Shell, virtueller Origin appassets.local, shouldInterceptRequest aus Assets, MIME-Map mit application/wasm, HTML5-Fullscreen via onShowCustomView/onHideCustomView, FLAG_KEEP_SCREEN_ON, Back-Button verlässt Fullscreen)
-- Icons via scripts/make_launcher_icons.py (PIL, Enten-Silhouette + Cyan-Ring, 5 Densities)
-- Android-SDK neu beschafft: build-tools r34 (aapt2/zipalign/apksigner + libc++.so-LD-Fix), platform-34-ext7_r03 (android.jar), R8 8.5.35, Temurin JDK 21 (javac fehlte im System-JRE)
-- Fix: aapt2 -A legt Assets OHNE out/-Präfix ab → ASSET_ROOT="" in MainActivity
-- Build: aapt2 link + 90MB Assets → 39,6 MB APK; dex via Python-zipfile; zipalign (LD_LIBRARY_PATH für libc++.so); apksigner v1+v2 mit neuem Keystore (alter ging beim Reset verloren)
-- Verifikation: versionCode='2' versionName='2.0', 94 STLs, g1.xml, mujoco.wasm, 9 ONNX, classes.dex, Signatur OK
-
-Stage Summary:
-- download/MicroDuckTrainer-v2.0.apk (39,6 MB, signiert) + download/microduck-trainer.keystore
-- WICHTIG: Neue Signatur → Nutzer muss v1.0 deinstallieren
-
----
-Task ID: 5
-Agent: main (Super Z)
-Task: GitHub-Upload + Download-Link
-
-Work Log:
-- Token verifiziert: User KilllerBoss
-- Repo erstellt: github.com/KilllerBoss/MicroDuckTrainer (public)
-- .gitignore (node_modules/out/.next/android-sdk/build-artifacts) + README.md (Features, Install, Build)
-- Commit + Push main; Release v2.0.0 erstellt (deutscher Changelog)
-- Assets hochgeladen: MicroDuckTrainer-v2.0.apk (39,6 MB) + microduck-trainer.keystore
-- Download-Link verifiziert: HTTP 200/206, binäre Probe beginnt mit "PK" (gültiges APK)
-
-Stage Summary:
-- Direkter Download: https://github.com/KilllerBoss/MicroDuckTrainer/releases/download/v2.0.0/MicroDuckTrainer-v2.0.apk
-- Release-Seite: https://github.com/KilllerBoss/MicroDuckTrainer/releases/tag/v2.0.0
-
----
-Task ID: 6
-Agent: main (Super Z)
-Task: Nutzer-Feedback umsetzen – kamera-relativer Joystick-Punkt, Punkt-Modi (Aus/Frei/Umkreis/Pfad mit Momentum), Distanz→Tempo, Gemini-Standard-Key
-
-Work Log:
-- rig.ts: World.getCamYaw() (Kamera-Gierwinkel für kamera-relative Steuerung) + World.setTargetPath() (orange Pfad-Trail-Linie, 256 Punkte)
-- app-core.ts: PointCfg-Typ { mode: aus|frei|umkreis|pfad, radius, speedByDist, maxSpeed, fullDist } mit Persistenz (mdt_v2_pointcfg_<model>, Migration vom alten Boolean-Pref)
-  * Kamera-relativ: vorne = (-cos camYaw, +sin camYaw) im MuJoCo-Frame, rechts = (f_y, -f_x) – verifiziert: Δy/Δx ≈ -0,69 bei camYaw 0,6 (vorher: Welt-Norden)
-  * umkreis/pfad: Punkt wird auf Radius um Roboter geklemmt (Leash) – Test: dist 0,999 ≤ 1,0
-  * pfad: Feder-Dämpfer-Führpunkt (k=16, ζ=0,8, vmax=2,5×maxSpeed) mit Momentum + Trail ~10 Hz – Test: Drift 0,05 m nach Joystick-Release, Trail sichtbar
-  * Distanz→Tempo: cmd_x = maxSpeed · clamp(dist/fullDist, 0,15, 1) · cos(yerr) – Test: nah 0,145 vs. fern 0,177
-  * markerShown-Flag gegen zurückgebliebenen Punkt-Marker beim Modellwechsel
-- ControlPanel.tsx: Segment-Buttons Aus/Frei/Umkreis/Pfad + Slider (Umkreis-Radius 0,3–6 m, Max-Tempo, Volldistanz) + Distanz→Tempo-Switch
-- gemini.ts: DEFAULT_GEMINI_KEY eingebaut (Nutzer-Key), GeminiPatch.point {mode,radius,speedByDist,maxSpeed,fullDist} + Prompt/Parser erweitert, klare Fehlermeldungen (Standort nicht unterstützt / Key ungültig)
-- GeminiPanel.tsx: Standard-Key-Hinweis, Punkt-Patch-Anwendung
-- Sandbox-HK: Gemini-API blockt Standort (FAILED_PRECONDITION) – Key selbst plausibel gültig (kein API_KEY_INVALID); auf Nutzer-Gerät (DE) erwartet funktional
-- QA (agent-browser): Boot clean, 4 Segmente + 2 Slider, Persistenz nach Reload, Screenshot mit Trail + Welt-Objekten
-- Build: lint 0 Fehler, Export OK, APK v2.1 (versionCode 3, 39,6 MB, gleiche Signatur wie v2.0 → Update ohne Deinstallation), Badging/Align/Signatur verifiziert
-- GitHub: Commit b2a1db6 gepusht, Release v2.1.0 erstellt, APK als Asset hochgeladen, Download verifiziert (HTTP 206, PK-Magic)
-
-Stage Summary:
-- Download: https://github.com/KilllerBoss/MicroDuckTrainer/releases/download/v2.1.0/MicroDuckTrainer-v2.1.apk
-- Release: https://github.com/KilllerBoss/MicroDuckTrainer/releases/tag/v2.1.0
-- v2.1 direkt über v2.0 installierbar (gleiche Signatur); nur v1.0-Nutzer müssen deinstallieren
-- Gemini-Key liegt eingebaut in der App; Hinweis auf Länder-/Netz-Sperre in Fehlermeldung + README
+- Trainings-Kette end-to-end validiert (Extraktion → ES → Verhalten im Node-Sim
+  und Browser). v2.3 behebt: Ente steht beim Training nur rum / fällt, G1-Zittern
+  (Lowpass + Glättung + Decay), GLB-Imitations-Fehlpose (Center+Clamp+Scale).
+- Bekannt: Sturzrate oszilliert während Exploration (Anker-Restart hält System
+  in gesundem Bereich); Curriculum startet bei 50 % und passt Tempo selbst an.
+- Build v2.3 (versionCode 5) folgt; Release v2.3.0 auf GitHub.

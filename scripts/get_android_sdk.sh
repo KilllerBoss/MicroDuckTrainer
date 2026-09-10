@@ -20,7 +20,7 @@ fi
 
 if [ ! -f $SDK/plat/android.jar ]; then
   echo "== platform-34 =="
-  curl -sL --retry 3 -o p34.zip https://dl.google.com/android/repository/platform-34_r02.zip
+  curl -sL --retry 3 -o p34.zip https://dl.google.com/android/repository/platform-34-ext7_r03.zip
   unzip -q -o p34.zip -d pex
   find pex -name android.jar -exec cp {} $SDK/plat/android.jar \;
 fi

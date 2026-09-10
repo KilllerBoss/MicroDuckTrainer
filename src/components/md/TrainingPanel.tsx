@@ -219,6 +219,131 @@ export default function TrainingPanel(props: TrainingPanelProps) {
         </div>
       </div>
 
+      {/* v2.3: Profi-Tricks (Warum fällt/zittert der Roboter? → das hier löst es) */}
+      <div className="space-y-3 rounded-lg border border-emerald-500/25 bg-emerald-500/5 p-3">
+        <div className="text-xs font-semibold text-emerald-300">Profi-Tricks (empfohlen: alle AN)</div>
+
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-[13px] text-slate-200">Befehle trainieren</div>
+            <p className="text-[10px] leading-snug text-slate-500">
+              Zufalls-Tempo pro Runde + Belohnung fürs Folgen. Ohne diesen Trick
+              weiß die Policy nie, dass sie LAUFEN soll – sie steht nur rum.
+            </p>
+          </div>
+          <Switch checked={cfg.cmdTrain} onCheckedChange={(v) => onTrainCfg({ cmdTrain: v })} />
+        </div>
+
+        {cfg.cmdTrain && (
+          <div>
+            <div className="mb-1 flex justify-between text-[11px] text-slate-400">
+              <span>Befehls-Tempo (m/s)</span>
+              <span className="font-mono text-emerald-300">{cfg.cmdFwd.toFixed(2)}</span>
+            </div>
+            <Slider
+              value={[cfg.cmdFwd]}
+              min={0.05}
+              max={0.6}
+              step={0.05}
+              onValueChange={(v) => onTrainCfg({ cmdFwd: v[0] })}
+            />
+            <p className="mt-0.5 text-[10px] text-slate-600">
+              Ente läuft natürlich ~0,25 m/s, Mensch ~0,5 m/s. Trainierte Policies
+              folgen danach auch dem Joystick im Test.
+            </p>
+          </div>
+        )}
+
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-[13px] text-slate-200">Curriculum (Tempo-Treppe)</div>
+            <p className="text-[10px] leading-snug text-slate-500">
+              Startet langsam, erhöht das Tempo automatisch, wenn die Sturzrate sinkt.
+              Profi-Standard für stabiles Laufenlernen.
+            </p>
+          </div>
+          <Switch checked={cfg.curriculum} onCheckedChange={(v) => onTrainCfg({ curriculum: v })} />
+        </div>
+
+        <div>
+          <div className="mb-1 flex justify-between text-[11px] text-slate-400">
+            <span>Aktions-Glättung (killt Zittern)</span>
+            <span className="font-mono text-emerald-300">
+              {cfg.actionSmooth >= 0.999 ? "aus" : cfg.actionSmooth.toFixed(2)}
+            </span>
+          </div>
+          <Slider
+            value={[cfg.actionSmooth]}
+            min={0.3}
+            max={1}
+            step={0.05}
+            onValueChange={(v) => onTrainCfg({ actionSmooth: v[0] })}
+          />
+          <p className="mt-0.5 text-[10px] text-slate-600">
+            Tiefpassfilter auf den Gelenkbefehlen (wie in echten Robotern). Klein
+            = ruhig + standfest, 1 = ungefiltert.
+          </p>
+        </div>
+
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-[13px] text-slate-200">Zufalls-Stöße</div>
+            <p className="text-[10px] leading-snug text-slate-500">
+              Schubser während der Runden – Policies werden robust statt glashaus-stabil.
+            </p>
+          </div>
+          <Switch checked={cfg.pushes} onCheckedChange={(v) => onTrainCfg({ pushes: v })} />
+        </div>
+
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-[13px] text-slate-200">Reset-Rauschen</div>
+            <p className="text-[10px] leading-snug text-slate-500">
+              Jede Runde startet leicht anders (Gelenke/Tempo variieren) statt immer exakt gleich.
+            </p>
+          </div>
+          <Switch checked={cfg.noiseReset} onCheckedChange={(v) => onTrainCfg({ noiseReset: v })} />
+        </div>
+
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-[13px] text-slate-200">Überlebens-Zählung</div>
+            <p className="text-[10px] leading-snug text-slate-500">
+              Fitness = Reward-SUMME: länger stehen/laufen bringt mehr. Vorher zählte
+              nur der Schnitt – Sturzzeitpunkt war egal (→ Roboter fiel gern mal).
+            </p>
+          </div>
+          <Switch
+            checked={cfg.fitnessMode === "sum"}
+            onCheckedChange={(v) => onTrainCfg({ fitnessMode: v ? "sum" : "mean" })}
+          />
+        </div>
+
+        <div>
+          <div className="mb-1 flex justify-between text-[11px] text-slate-400">
+            <span>Gewichtsbremse (gegen Verkrampfung)</span>
+            <span className="font-mono text-emerald-300">{cfg.weightDecay.toFixed(3)}</span>
+          </div>
+          <Slider
+            value={[cfg.weightDecay]}
+            min={0}
+            max={0.05}
+            step={0.005}
+            onValueChange={(v) => onTrainCfg({ weightDecay: v[0] })}
+          />
+          <p className="mt-0.5 text-[10px] text-slate-600">
+            Hält Netzgewichte klein → keine saturierten Ausgänge → kein Zappeln. 0 = aus.
+          </p>
+        </div>
+
+        {es && (
+          <div className="flex items-center justify-between rounded-md bg-black/30 px-2.5 py-1.5 text-[11px]">
+            <span className="text-slate-400">Curriculum-Tempo-Stufe</span>
+            <span className="font-mono text-emerald-300">{(es.speedScale * 100).toFixed(0)}%</span>
+          </div>
+        )}
+      </div>
+
       {/* Aktionen */}
       <div className="grid grid-cols-2 gap-2">
         <Button

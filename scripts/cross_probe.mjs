@@ -1,0 +1,12 @@
+import * as ort from "onnxruntime-web/wasm";
+import { readFileSync } from "fs";
+ort.env.wasm.wasmPaths = "file:///home/z/my-project/node_modules/onnxruntime-web/dist/";
+ort.env.wasm.numThreads = 1;
+const buf = new Uint8Array(readFileSync("public/policies/BEST_alpha_walking.onnx"));
+const session = await ort.InferenceSession.create(buf, { executionProviders: ["wasm"] });
+const xb = readFileSync("/tmp/x.bin");
+const x = new Float32Array(xb.buffer, xb.byteOffset, xb.byteLength / 4);
+const feeds = { obs: new ort.Tensor("float32", x, [1, 61]) };
+const r = await session.run(feeds);
+console.log("ort ONNX(x):", Array.from(r.actions.data.slice(0,6)).map(v=>v.toFixed(3)).join(", "));
+console.log("x:", Array.from(x.slice(0,5)).map(v=>v.toFixed(3)).join(", "));

@@ -314,8 +314,9 @@ export interface World {
   setTargetPoint: (x: number, y: number, visible: boolean) => void;
   /** v2.2: Kamera-Gierwinkel (three.js-Raum) für kamera-relativen Joystick. */
   getCamYaw: () => number;
-  /** v2.2: Pfad-Trail setzen (MuJoCo x/y-Punkte) oder ausblenden (null). */
-  setTargetPath: (pts: [number, number][] | null) => void;
+  /** v2.3: Schwebende Kurve Roboter → Punkt (Game-Waypoint-Stil).
+   *  from = MuJoCo-Torso (x,y,z), to = Zielpunkt (x,y); null/null = aus. */
+  setTargetCurve: (from: [number, number, number] | null, to: [number, number] | null) => void;
   dispose: () => void;
 }
 
@@ -404,26 +405,35 @@ export async function createWorld(container: HTMLElement): Promise<World> {
   scene.add(worldProps);
   let markerPulse = 0;
 
-  // v2.2: Pfad-Trail (Momentum-Führpunkt) – Linie knapp über dem Boden
-  const PATH_MAX = 256;
-  const pathGeom = new THREE.BufferGeometry();
-  pathGeom.setAttribute(
+  // v2.3: Schwebende Pfad-Kurve (Game-Waypoint-Stil): flüssige Bézier vom
+  // Roboter zum Punkt, leicht über dem Boden, mit wanderndem Leuchtpunkt.
+  const CURVE_MAX = 40;
+  const curveGeom = new THREE.BufferGeometry();
+  curveGeom.setAttribute(
     "position",
-    new THREE.BufferAttribute(new Float32Array(PATH_MAX * 3), 3),
+    new THREE.BufferAttribute(new Float32Array(CURVE_MAX * 3), 3),
   );
-  pathGeom.setDrawRange(0, 0);
-  const pathLine = new THREE.Line(
-    pathGeom,
+  curveGeom.setDrawRange(0, 0);
+  const curveLine = new THREE.Line(
+    curveGeom,
     new THREE.LineBasicMaterial({
       color: 0xffb14d,
       transparent: true,
-      opacity: 0.65,
+      opacity: 0.85,
       depthWrite: false,
+      blending: THREE.AdditiveBlending,
     }),
   );
-  pathLine.frustumCulled = false;
-  pathLine.visible = false;
-  scene.add(pathLine);
+  curveLine.frustumCulled = false;
+  curveLine.visible = false;
+  scene.add(curveLine);
+  const curveDot = new THREE.Mesh(
+    new THREE.SphereGeometry(0.035, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0xffd9a0, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false }),
+  );
+  curveDot.visible = false;
+  scene.add(curveDot);
+  let curveDotT = 0; // Position des wandernden Punkts auf der Kurve (0..1)
 
   let duckRig: DuckRig | null = null;
   let g1Rig: G1Rig | null = null;
@@ -486,27 +496,48 @@ export async function createWorld(container: HTMLElement): Promise<World> {
     getCamYaw() {
       return camSph.yaw;
     },
-    setTargetPath(pts) {
-      if (!pts || pts.length < 2) {
-        pathLine.visible = false;
+    setTargetCurve(from, to) {
+      if (!from || !to) {
+        curveLine.visible = false;
+        curveDot.visible = false;
         return;
       }
-      const n = Math.min(pts.length, PATH_MAX);
-      const pos = pathGeom.attributes.position as THREE.BufferAttribute;
-      for (let i = 0; i < n; i++) {
-        // MuJoCo (x, y) → three (x, y_up, -y)
-        pos.setXYZ(i, pts[i][0], 0.02, -pts[i][1]);
+      // MuJoCo (x, y, z-up) → three (x, y_up, -z)
+      const ax = from[0], ay = from[2] + 0.08, az = -from[1]; // Start: Torso
+      const bx = to[0], by = 0.22, bz = -to[1]; // Ende: Punkt-Marker (schwebend)
+      // Quadratische Bézier mit Kontrollpunkt über der Mitte (flüssiger Bogen)
+      const lift = 0.18 + Math.min(0.5, Math.hypot(bx - ax, bz - az) * 0.18);
+      const cx = (ax + bx) / 2, cy = Math.max(ay, by) + lift, cz = (az + bz) / 2;
+      const pos = curveGeom.attributes.position as THREE.BufferAttribute;
+      for (let i = 0; i < CURVE_MAX; i++) {
+        const t = i / (CURVE_MAX - 1);
+        const u = 1 - t;
+        pos.setXYZ(
+          i,
+          u * u * ax + 2 * u * t * cx + t * t * bx,
+          u * u * ay + 2 * u * t * cy + t * t * by,
+          u * u * az + 2 * u * t * cz + t * t * bz,
+        );
       }
-      pathGeom.setDrawRange(0, n);
       pos.needsUpdate = true;
-      pathGeom.computeBoundingSphere();
-      pathLine.visible = true;
+      curveGeom.computeBoundingSphere();
+      curveLine.visible = true;
+      curveDot.visible = true;
     },
     updateCamera(dt) {
       if (marker.visible) {
         markerPulse += dt * 5;
         const k = 1 + Math.sin(markerPulse) * 0.12;
         markerRing.scale.setScalar(k);
+      }
+      if (curveLine.visible) {
+        // Wandernder Leuchtpunkt Roboter → Punkt (Game-Feel)
+        curveDotT = (curveDotT + dt * 0.55) % 1;
+        const pos = curveGeom.attributes.position as THREE.BufferAttribute;
+        const i0 = Math.floor(curveDotT * (CURVE_MAX - 1));
+        if (pos.count > i0) {
+          curveDot.position.set(pos.getX(i0), pos.getY(i0) + 0.02, pos.getZ(i0));
+        }
       }
       smoothTarget.lerp(target, Math.min(1, dt * 6));
       const cp = new THREE.Vector3(

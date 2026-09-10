@@ -7,7 +7,7 @@
 import type { ModelMeta, ModelId } from "./models";
 import { getModel } from "./models";
 import { Engine } from "./engine";
-import { MlpPolicy, type MlpLayout } from "./policy";
+import { MlpPolicy, hiddenList, type MlpLayout } from "./policy";
 import type { RewardConfig } from "./rewards";
 import type { WorldBuild } from "./worldgen";
 import { getCustomFn, evalCustomFn, type CustomRewardFn } from "./customcode";
@@ -103,11 +103,18 @@ export interface EsStats {
   fellRate: number;
   evaluator: "worker" | "main";
   workersReady: number;
+  speedScale: number; // v2.3: Curriculum-Tempo-Stufe
 }
 
 const BASE_SIGMA = 0.08;
 const LR = 0.03;
 const STAGNATION_GENS = 8;
+
+/** v2.3: Layer-Dimensionen eines Layouts ([obs, ...hidden, action]). */
+export function layerDims(layout: MlpLayout): number[] {
+  const hs = hiddenList(layout.hidden);
+  return [layout.obsDim, ...hs, layout.actionDim];
+}
 
 // ── Rollout-Kontext (kooperativ schrittweise, für Interleaving) ──────────────
 
@@ -122,18 +129,29 @@ interface RolloutCtx {
   done: boolean;
   prevAct: Float32Array;
   act: Float32Array;
+  actF: Float32Array; // v2.3: tiefpassgefilterte Aktion (Action-Lowpass)
+  pushTick: number; // v2.3: Schritt-Zähler für Zufalls-Stöße
 }
 
-function resetCtx(engine: Engine, ctx: RolloutCtx) {
+function resetCtx(
+  engine: Engine, ctx: RolloutCtx, run: RunCfg,
+  cmd: Float32Array | null,
+) {
   engine.setData(ctx.data);
   engine.resetToKeyframe();
+  engine.trackCmd = false;
+  if (run.noiseReset) engine.addResetNoise();
   engine.cmd.fill(0);
+  if (cmd) engine.cmd.set(cmd); // v2.3: Befehl des Paares (Domain-Randomization)
+  engine.trackCmd = run.cmdTrain && !!cmd;
   ctx.n = 0;
   ctx.t = 0;
   ctx.sum = 0;
   ctx.fell = false;
   ctx.done = false;
   ctx.prevAct.fill(0);
+  ctx.actF.fill(0);
+  ctx.pushTick = 0;
 }
 
 /** Zusatz-Info für den Custom-Code-Term (Zeit/Schritt). */
@@ -156,15 +174,33 @@ export function stepRewardValue(
   const vx = Math.cos(yaw) * qvel[0] + Math.sin(yaw) * qvel[1];
   const vy = -Math.sin(yaw) * qvel[0] + Math.cos(yaw) * qvel[1];
   const omega = qvel[5];
+  // v2.3: Befehls-Tracking (Profi-Stil MJX-Playground): Vorwärts/Seitwärts-Term
+  // folgt dem aktiven Befehl (Training: zufällig gezogen, Test: Joystick) mit
+  // exp(-Fehler²/σ²) statt fester Linear-Skala.
+  const tracking = engine.trackCmd === true;
+  const cmd0 = engine.cmd[0] ?? 0;
+  const cmd1 = engine.cmd[1] ?? 0;
   let val = 0;
   if (T.upright?.enabled) val += T.upright.weight * upZ;
   if (T.height?.enabled) {
     val += T.height.weight * (1 - Math.abs(h - T.height.param) / Math.max(0.05, T.height.param));
   }
   if (T.forward?.enabled) {
-    val += T.forward.weight * Math.max(0, 1 - Math.abs(vx - T.forward.param) / 0.5);
+    if (tracking) {
+      const dvx = vx - cmd0, dvy = vy - cmd1;
+      val += T.forward.weight * Math.exp(-(dvx * dvx + dvy * dvy) / 0.25);
+    } else {
+      val += T.forward.weight * Math.max(0, 1 - Math.abs(vx - T.forward.param) / 0.5);
+    }
   }
-  if (T.lateral?.enabled) val += T.lateral.weight * Math.max(-1, Math.min(1, vy));
+  if (T.lateral?.enabled) {
+    if (tracking) {
+      const dvy = vy - cmd1;
+      val += T.lateral.weight * Math.exp(-(dvy * dvy) / 0.25);
+    } else {
+      val += T.lateral.weight * Math.max(-1, Math.min(1, vy));
+    }
+  }
   if (T.yaw?.enabled) val += T.yaw.weight * (1 - Math.min(1, Math.abs(omega - (engine.cmd[2] ?? 0))));
   if (T.alive?.enabled) val += T.alive.weight;
   if (T.energy?.enabled) {
@@ -266,11 +302,21 @@ export function stepRewardValue(
 function ctxStep(
   engine: Engine, ctx: RolloutCtx, cfg: RewardConfig,
   imit: ImitEvalData | null, imitBuf: Float32Array | null, policyDt: number,
+  run: RunCfg,
 ): void {
   const T = cfg.terms;
   engine.setData(ctx.data);
   if (imit && imitBuf) {
     const delta = imitSampleAt(imit, ctx.t, imitBuf);
+    // v2.3: Imitations-Ziele auf Aktuator-Range klemmen (Human-Clips haben
+    // größere Amplituden als die Gelenke erlauben)
+    const lims = engine.ctrlLimits;
+    if (lims) {
+      for (let j = 0; j < imitBuf.length; j++) {
+        const lo = lims[j * 2], hi = lims[j * 2 + 1];
+        if (hi > lo) imitBuf[j] = Math.min(hi, Math.max(lo, imitBuf[j]));
+      }
+    }
     engine.imitTarget = imitBuf;
     engine.imitRootDelta = delta;
     const ph = (imit.duration > 0 ? (ctx.t % imit.duration) / imit.duration : 0) * 2 * Math.PI;
@@ -278,27 +324,51 @@ function ctxStep(
   }
   const obs = engine.obsFor(!!imit);
   ctx.mlp.forward(obs, ctx.act);
-  engine.lastAction.set(ctx.act);
-  engine.stepWithAction(ctx.act);
+  // v2.3: Action-Lowpass (Profi-Trick gegen Zittern): gefilterte Aktion
+  // steuert Physik UND Obs; Smoothness vergleicht die gefilterten Werte.
+  const a = run.actionSmooth;
+  if (a < 0.999) {
+    for (let j = 0; j < ctx.act.length; j++) {
+      ctx.actF[j] = a * ctx.act[j] + (1 - a) * ctx.actF[j];
+    }
+  } else {
+    ctx.actF.set(ctx.act);
+  }
+  engine.lastAction.set(ctx.actF);
+  engine.stepWithAction(ctx.actF);
   ctx.n++;
   ctx.t += policyDt;
 
+  // v2.3: Zufalls-Stöße (Domain-Randomization, Profi-Trick für Robustheit)
+  if (run.pushes && ++ctx.pushTick >= 55) {
+    ctx.pushTick = 0;
+    engine.applyPush();
+  }
+
   ctx.sum += stepRewardValue(
-    engine, cfg, ctx.act, ctx.prevAct, { t: ctx.t, step: ctx.n, dt: policyDt },
+    engine, cfg, ctx.actF, ctx.prevAct, { t: ctx.t, step: ctx.n, dt: policyDt },
   );
-  ctx.prevAct.set(ctx.act);
+  ctx.prevAct.set(ctx.actF);
 
   if (engine.isFallen()) {
     ctx.fell = true;
     ctx.done = true;
-    if (T.fall?.enabled) ctx.sum -= T.fall.weight * ctx.n; // wird unten /n geteilt
+    if (T.fall?.enabled) {
+      // v2.3: Summen-Modus → FLACHE Strafe (Ranking steigt stetig mit der
+      // Überlebensdauer); Mittel-Modus → ×n (pro-step-Beitrag wie bisher).
+      ctx.sum -= run.fitnessMode === "sum"
+        ? T.fall.weight
+        : T.fall.weight * ctx.n;
+    }
   } else if (ctx.n >= ctx.steps) {
     ctx.done = true;
   }
 }
 
-function finishCtx(ctx: RolloutCtx): number {
-  return ctx.n > 0 ? ctx.sum / ctx.n : 0;
+function finishCtx(ctx: RolloutCtx, mode: "sum" | "mean"): number {
+  // v2.3: Summen-Modus (Profi-Trick): länger überleben = mehr Reward-Akkumulation
+  // → natürlicher Überlebensdruck; Mittelwert macht Sturzzeitpunkt egal.
+  return mode === "sum" ? ctx.sum : (ctx.n > 0 ? ctx.sum / ctx.n : 0);
 }
 
 // ── EsTrainer ────────────────────────────────────────────────────────────────
@@ -336,6 +406,9 @@ export class EsTrainer {
   imit: ImitEvalData | null = null;
   imitSig = "";
   obsExtraActive = false; // Phase aktuell in der Obs?
+  // v2.3: Profi-Trainings-Konfiguration + Curriculum-Phase
+  runCfg: RunCfg = defaultRunCfg();
+  speedScale = 0.5; // Curriculum: Befehls-Tempo-Stufe (0.15..1)
 
   private workers: Worker[] = [];
   private pending = new Map<number, (r: { fitness: number; fell: boolean; steps: number }) => void>();
@@ -414,6 +487,9 @@ export class EsTrainer {
             dim: this.imit.dim, frames: this.imit.frames, fps: this.imit.fps,
             duration: this.imit.duration, targets: this.imit.targets.buffer,
             rootY: this.imit.rootY.buffer, baseY: this.imit.baseY,
+            // v2.3: Cross-Species-Retargeting (Center-Pose + Höhen-Skalierung)
+            center: this.imit.center ? this.imit.center.buffer : null,
+            scaleY: this.imit.scaleY ?? 1,
           }
         : null,
     };
@@ -457,19 +533,25 @@ export class EsTrainer {
     resolve({ fitness: msg.fitness, fell: msg.fell, steps: msg.steps });
   }
 
-  private evalViaWorker(theta: Float32Array): Promise<{ fitness: number; fell: boolean; steps: number }> {
+  private evalViaWorker(
+    theta: Float32Array, cmd: Float32Array | null,
+  ): Promise<{ fitness: number; fell: boolean; steps: number }> {
     const jobId = ++this.jobId;
     const w = this.workers[jobId % this.workers.length];
     const p = new Promise<{ fitness: number; fell: boolean; steps: number }>((resolve) => {
       this.pending.set(jobId, resolve);
     });
     const copy = theta.slice();
+    const cmdCopy = cmd ? cmd.slice() : null;
     w.postMessage(
       {
         type: "eval", jobId,
         theta: copy.buffer, layout: this.layout, reward: this.reward,
         rolloutSteps: this.rolloutSteps,
         targetPoint: this.pointSnapshot ? [...this.pointSnapshot] : null,
+        // v2.3: Profi-Rollout-Konfiguration + Befehl des Paares
+        run: { ...this.runCfg },
+        cmd: cmdCopy ? Array.from(cmdCopy) : null,
       },
       [copy.buffer],
     );
@@ -483,13 +565,15 @@ export class EsTrainer {
   }
 
   /** Evaluierung der Population: Worker-Pool oder Main-Thread-Interleaving. */
-  private async evalBatch(members: Float32Array[]): Promise<{ fitness: number; fell: boolean }[]> {
+  private async evalBatch(
+    members: Float32Array[], cmds: (Float32Array | null)[],
+  ): Promise<{ fitness: number; fell: boolean }[]> {
     const results: { fitness: number; fell: boolean }[] = new Array(members.length);
     this.stepsCounter = 0;
     if (this.evaluator === "worker" && this.workers.length > 0) {
       await Promise.all(
         members.map(async (m, i) => {
-          const r = await this.evalViaWorker(m);
+          const r = await this.evalViaWorker(m, cmds[i]);
           results[i] = r;
         }),
       );
@@ -499,7 +583,7 @@ export class EsTrainer {
       const slots = Math.min(6, members.length);
       for (let batch = 0; batch < members.length; batch += slots) {
         const batchMembers = members.slice(batch, batch + slots);
-        const ctxs: RolloutCtx[] = batchMembers.map((m) => {
+        const ctxs: RolloutCtx[] = batchMembers.map((m, k) => {
           const ctx: RolloutCtx = {
             data: this.dataPool.pop() ?? this.engine.newData(),
             mlp: new MlpPolicy(this.layout, m),
@@ -507,20 +591,22 @@ export class EsTrainer {
             n: 0, t: 0, sum: 0, fell: false, done: false,
             prevAct: new Float32Array(this.layout.actionDim),
             act: new Float32Array(this.layout.actionDim),
+            actF: new Float32Array(this.layout.actionDim),
+            pushTick: 0,
           };
-          resetCtx(this.engine, ctx);
+          resetCtx(this.engine, ctx, this.runCfg, cmds[batch + k] ?? null);
           return ctx;
         });
         while (ctxs.some((c) => !c.done)) {
           for (const ctx of ctxs) {
             if (!ctx.done) {
-              ctxStep(this.engine, ctx, this.reward, this.imit, this.imitBuf, this.policyDt);
+              ctxStep(this.engine, ctx, this.reward, this.imit, this.imitBuf, this.policyDt, this.runCfg);
             }
           }
           await new Promise<void>((r) => setTimeout(r, 0)); // UI-Yield
         }
         for (let i = 0; i < ctxs.length; i++) {
-          results[batch + i] = { fitness: finishCtx(ctxs[i]), fell: ctxs[i].fell };
+          results[batch + i] = { fitness: finishCtx(ctxs[i], this.runCfg.fitnessMode), fell: ctxs[i].fell };
           this.stepsCounter += ctxs[i].n;
           this.dataPool.push(ctxs[i].data); // zurück in den Pool statt GC/Leak
         }
@@ -537,21 +623,69 @@ export class EsTrainer {
     this.reward = cfg;
   }
 
+  /** v2.3: Profi-Trainings-Konfiguration übernehmen. */
+  setRunCfg(cfg: RunCfg): void {
+    this.runCfg = cfg;
+    if (!cfg.curriculum) this.speedScale = 1;
+  }
+
+  /** v2.3: Befehl für ein antithetisches Paar ziehen (beide Mitglieder gleich,
+   *  sonst vergleicht der Gradient Äpfel mit Birnen). */
+  private sampleCmd(): Float32Array | null {
+    if (!this.runCfg.cmdTrain) return null;
+    const s = this.speedScale;
+    const cmd = new Float32Array(this.meta.cmdSize);
+    // ~75 % vorwärts, sonst leicht rückwärts/stand – repräsentative Mischung
+    const fwd = Math.random() < 0.75 ? Math.random() : Math.random() * 0.35 - 0.35;
+    cmd[0] = this.runCfg.cmdFwd * s * fwd;
+    if (cmd.length > 1) cmd[1] = this.runCfg.cmdLat * (Math.random() * 2 - 1) * 0.6 * s;
+    if (cmd.length > 2) cmd[2] = this.runCfg.cmdAng * (Math.random() * 2 - 1) * 0.7;
+    return cmd;
+  }
+
+  /** v2.3: Curriculum-Schritt nach jeder Generation (Tempo-Treppe). */
+  private curriculumStep(): void {
+    if (!this.runCfg.curriculum) return;
+    if (this.lastFellRate > 0.3) {
+      this.speedScale = Math.max(0.15, this.speedScale * 0.8);
+    } else if (this.lastFellRate < 0.05) {
+      this.speedScale = Math.min(1, this.speedScale * 1.08 + 0.02);
+    }
+  }
+
   /** Eine ES-Generation: antithetisches Sampling → Evaluierung → Update. */
   async runGeneration(): Promise<void> {
     const pop = popSizeFor(this.turbo);
     const pairs = Math.ceil(pop / 2);
     const members: Float32Array[] = [];
     const epsilons: Float32Array[] = [];
+    const cmds: (Float32Array | null)[] = [];
+    // v2.3: FAN-IN-SKALIERUNG (Profi-Trick für große Netze): Störung je Gewicht
+    // wird durch √(fan-in) der Schicht geteilt, sonst ist die Verhaltens-Störung
+    // bei 197k-Gewicht-Netzen (512→256→128) so groß, dass JEDES Mitglied
+    // sofort stürzt (beobachtet: Sturzrate 100 % bei Schritt ~5).
+    const dims = layerDims(this.layout);
     for (let i = 0; i < pairs; i++) {
       const eps = new Float32Array(this.theta.length);
-      for (let j = 0; j < eps.length; j++) eps[j] = gauss() * this.sigma;
+      let off = 0;
+      for (let l = 0; l < dims.length - 1; l++) {
+        const inDim = dims[l], outDim = dims[l + 1];
+        const wScale = this.sigma / Math.sqrt(inDim);
+        const nW = outDim * inDim;
+        for (let j = 0; j < nW; j++) eps[off + j] = gauss() * wScale;
+        off += nW;
+        for (let j = 0; j < outDim; j++) eps[off + j] = gauss() * this.sigma;
+        off += outDim;
+      }
       epsilons.push(eps);
       members.push(Float32Array.from(this.theta.map((v, j) => v + eps[j])));
       members.push(Float32Array.from(this.theta.map((v, j) => v - eps[j])));
+      // v2.3: EIN Befehl pro Paar (fairer Gradientenvergleich)
+      const c = this.sampleCmd();
+      cmds.push(c, c);
     }
     const t0 = performance.now();
-    const results = await this.evalBatch(members.slice(0, pop));
+    const results = await this.evalBatch(members.slice(0, pop), cmds.slice(0, pop));
     const dt = Math.max(1, performance.now() - t0);
     this.stepsPerSec = (this.stepsCounter / dt) * 1000;
 
@@ -576,8 +710,10 @@ export class EsTrainer {
       for (let j = 0; j < grad.length; j++) grad[j] += s * eps[j];
     }
     const norm = this.lr / this.sigma;
+    const wd = this.runCfg.weightDecay;
     for (let j = 0; j < this.theta.length; j++) {
-      this.theta[j] += grad[j] * norm;
+      // v2.3: Gewichtsbremse (Decay gegen saturierte tanh → weniger Zittern)
+      this.theta[j] = this.theta[j] * (1 - this.lr * wd) + grad[j] * norm;
     }
 
     const bestIdx = order[n - 1];
@@ -601,6 +737,15 @@ export class EsTrainer {
         this.sigma = Math.max(0.005, this.sigma * 0.85); // adaptiv schrumpfen
       }
     }
+    // v2.3: Anker-Restart (Profi-Trick): driftet theta während der Exploration
+    // in eine schlechte Region (hohe Sturzrate trotz geschrumpftem Sigma),
+    // kehrt es zum besten je gefundenen Punkt zurück und versucht neu.
+    if (this.sinceImprovement >= STAGNATION_GENS * 3 && this.lastFellRate > 0.5) {
+      this.theta = this.bestTheta.slice();
+      this.sinceImprovement = 0;
+      this.sigma = Math.min(this.baseSigma, this.sigma * 1.5 + 0.005);
+    }
+    this.curriculumStep(); // v2.3: Tempo-Treppe nach jeder Generation
   }
 
   stats(): EsStats {
@@ -615,6 +760,7 @@ export class EsTrainer {
       fellRate: this.lastFellRate,
       evaluator: this.evaluator,
       workersReady: this.workersReady,
+      speedScale: this.speedScale,
     };
   }
 
@@ -641,6 +787,8 @@ export interface WorkerInitPayload {
   imitation: {
     dim: number; frames: number; fps: number; duration: number;
     targets: ArrayBufferLike; rootY: ArrayBufferLike; baseY: number;
+    center: ArrayBufferLike | null; // v2.3: Zentrum-Pose (absolut)
+    scaleY: number; // v2.3: Wurzel-Höhen-Skalierung
   } | null;
 }
 

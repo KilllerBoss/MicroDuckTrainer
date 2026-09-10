@@ -10,7 +10,7 @@ let ctx = null; // { modelId, obsDim, actionDim, cmdSize, obsType, decimation, a
 let addrs = null; // { qposAdr, dofAdr, gyroAdr, torsoId, ballQposAdr, ballDofAdr, ctrlRange, jntRange }
 let standPose = null;
 let data = null;
-let imit = null; // { dim, frames, fps, duration, targets, rootY, baseY }
+let imit = null; // { dim, frames, fps, duration, targets, rootY, baseY, center, scaleY }
 let imitBuf = null;
 let policyDt = 0.02;
 let pointSnapshot = null; // [x, y] | null (Punkt-Modus, Snapshot je Eval)
@@ -108,6 +108,9 @@ async function boot(payload) {
       targets: new Float32Array(ctx.imitation.targets),
       rootY: new Float32Array(ctx.imitation.rootY),
       baseY: ctx.imitation.baseY,
+      // v2.3: Cross-Species-Retargeting (Center-Pose + Höhen-Skalierung)
+      center: ctx.imitation.center ? new Float32Array(ctx.imitation.center) : null,
+      scaleY: ctx.imitation.scaleY ?? 1,
     };
     imitBuf = new Float32Array(imit.dim);
   }
@@ -164,6 +167,38 @@ function resetToKeyframe() {
   standPose = new Float32Array(ctx.actionDim);
   for (let j = 0; j < ctx.actionDim; j++) standPose[j] = qpos[addrs.qposAdr[j]];
   applyCtrlFromPose(standPose);
+}
+
+// v2.3: Reset-Rauschen (Reference-State-Init) – identisch zu engine.addResetNoise
+function addResetNoise() {
+  const qpos = data.qpos;
+  const qvel = data.qvel;
+  for (let j = 0; j < ctx.actionDim; j++) {
+    qpos[addrs.qposAdr[j]] += gauss() * 0.03;
+    qvel[addrs.dofAdr[j]] += gauss() * 0.1;
+  }
+  qvel[0] += gauss() * 0.05;
+  qvel[1] += gauss() * 0.05;
+  mujoco.mj_forward(model, data);
+  applyCtrlFromPose(standPose);
+}
+
+// v2.3: Zufalls-Stöße (Domain-Randomization) – identisch zu engine.applyPush
+function applyPush() {
+  const qvel = data.qvel;
+  qvel[0] += gauss() * 0.35;
+  qvel[1] += gauss() * 0.35;
+  qvel[3] += gauss() * 0.2;
+  qvel[4] += gauss() * 0.2;
+  qvel[5] += gauss() * 0.3;
+}
+
+// Box–Muller (geteilt mit es.ts)
+function gauss() {
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
 }
 
 function applyCtrlFromPose(targets) {
@@ -249,12 +284,14 @@ function imitSampleAt(d, t, out) {
   const f0 = Math.min(d.frames - 1, Math.floor(x));
   const f1 = Math.min(d.frames - 1, f0 + 1);
   const u = x - f0;
+  const c = d.center;
   for (let j = 0; j < d.dim; j++) {
     const a = d.targets[f0 * d.dim + j];
     const b = d.targets[f1 * d.dim + j];
-    out[j] = a + (b - a) * u;
+    out[j] = (a + (b - a) * u) + (c ? c[j] : 0);
   }
-  return (d.rootY[f0] + (d.rootY[f1] - d.rootY[f0]) * u) - d.baseY;
+  const raw = (d.rootY[f0] + (d.rootY[f1] - d.rootY[f0]) * u) - d.baseY;
+  return raw * (d.scaleY ?? 1);
 }
 
 function isFallen() {
@@ -265,38 +302,72 @@ function isFallen() {
   return z < fallHeight || gz > -0.5;
 }
 
-// MLP (identisch zu src/lib/md/policy.ts)
-function mlpForward(layout, w1, b1, w2, b2, obs, hiddenBuf, act) {
-  const o = layout.obsDim, h = layout.hidden, a = layout.actionDim;
-  for (let j = 0; j < h; j++) {
-    let s = b1[j];
-    const base = j * o;
-    for (let k = 0; k < o; k++) s += w1[base + k] * obs[k];
-    hiddenBuf[j] = Math.tanh(s);
-  }
-  for (let i = 0; i < a; i++) {
-    let s = b2[i];
-    const base = i * h;
-    for (let k = 0; k < h; k++) s += w2[base + k] * hiddenBuf[k];
-    act[i] = Math.tanh(s);
-  }
-  return act;
+// MLP (v2.3: generisch N Layer – identisch zu src/lib/md/policy.ts)
+function hiddenList(h) {
+  if (Array.isArray(h)) return h.length ? h : [32];
+  if (typeof h === "number" && h > 0) return [h];
+  return [32];
 }
 
-function runRollout(theta, layout, reward, steps, targetPoint) {
+function actApply(a, v) {
+  if (a === "relu") { for (let i = 0; i < v.length; i++) if (v[i] < 0) v[i] = 0; }
+  else if (a === "elu") { for (let i = 0; i < v.length; i++) if (v[i] < 0) v[i] = Math.expm1(v[i]); }
+  else if (a === "sigmoid") { for (let i = 0; i < v.length; i++) v[i] = 1 / (1 + Math.exp(-v[i])); }
+  else { for (let i = 0; i < v.length; i++) v[i] = Math.tanh(v[i]); }
+}
+
+function mlpForward(layout, theta, obs, out) {
+  const hs = hiddenList(layout.hidden);
+  const dims = [layout.obsDim, ...hs, layout.actionDim];
+  const outTanh = layout.outputTanh !== false;
+  const act = layout.act ?? "tanh";
+  let off = 0;
+  let src = obs;
+  for (let l = 0; l < dims.length - 1; l++) {
+    const inDim = dims[l], outDim = dims[l + 1];
+    const w = theta.subarray(off, off + outDim * inDim);
+    off += outDim * inDim;
+    const b = theta.subarray(off, off + outDim);
+    off += outDim;
+    const buf = out[l];
+    for (let i = 0; i < outDim; i++) {
+      let s = b[i];
+      const base = i * inDim;
+      for (let k = 0; k < inDim; k++) s += w[base + k] * src[k];
+      buf[i] = s;
+    }
+    const isLast = l === dims.length - 2;
+    if (!isLast) actApply(act, buf);
+    else if (outTanh) { for (let i = 0; i < buf.length; i++) buf[i] = Math.tanh(buf[i]); }
+    src = buf;
+  }
+  return src;
+}
+
+function runRollout(theta, layout, reward, steps, targetPoint, run, cmdArr) {
+  run = run || {};
+  const runCfg = {
+    cmdTrain: run.cmdTrain ?? false,
+    actionSmooth: run.actionSmooth ?? 1,
+    pushes: run.pushes ?? false,
+    noiseReset: run.noiseReset ?? false,
+    fitnessMode: run.fitnessMode ?? "mean",
+  };
   resetToKeyframe();
-  const o = layout.obsDim, h = layout.hidden;
-  const w1 = theta.slice(0, h * o);
-  const b1 = theta.slice(h * o, h * o + h);
-  const w2 = theta.slice(h * o + h, h * o + h + layout.actionDim * h);
-  const b2 = theta.slice(h * o + h + layout.actionDim * h);
+  if (runCfg.noiseReset) addResetNoise();
+  const o = layout.obsDim;
   const obs = new Float32Array(o);
-  const hiddenBuf = new Float32Array(h);
   const act = new Float32Array(layout.actionDim);
+  const actF = new Float32Array(layout.actionDim); // v2.3: Action-Lowpass
   const prevAct = new Float32Array(layout.actionDim);
   const lastAction = new Float32Array(layout.actionDim);
   const cmd = new Float32Array(ctx.cmdSize);
+  if (cmdArr) cmd.set(cmdArr);
+  const tracking = runCfg.cmdTrain && !!cmdArr; // v2.3: Befehls-Tracking
   const T = reward.terms;
+  // v2.3: Layer-Buffer + theta direkt (N-Layer-Netz)
+  const hs = hiddenList(layout.hidden);
+  const bufs = hs.concat(layout.actionDim).map((n) => new Float32Array(n));
   // v2.2: wiederverwendetes API-Objekt für den KI-Code-Term (kein GC-Druck)
   const customTerm = reward.custom;
   const customUse = !!(customTerm && customTerm.enabled && customTerm.code);
@@ -313,18 +384,39 @@ function runRollout(theta, layout, reward, steps, targetPoint) {
   } : null;
   let sum = 0, n = 0, fell = false;
   let tImit = 0; // Imitations-Zeit (s)
+  let pushTick = 0; // v2.3: Zufalls-Stöße
   for (let t = 0; t < steps; t++) {
     if (imit && imitBuf) {
       imitRootDelta = imitSampleAt(imit, tImit, imitBuf);
+      // v2.3: Imitations-Ziele auf Aktuator-Range klemmen (Human-Amplituden!)
+      if (addrs.ctrlRange) {
+        for (let j = 0; j < imitBuf.length; j++) {
+          const lo = addrs.ctrlRange[j * 2], hi = addrs.ctrlRange[j * 2 + 1];
+          if (hi > lo) imitBuf[j] = Math.min(hi, Math.max(lo, imitBuf[j]));
+        }
+      }
       imitTarget = imitBuf;
       const ph = (imit.duration > 0 ? (tImit % imit.duration) / imit.duration : 0) * 2 * Math.PI;
       imitPhase = [Math.sin(ph), Math.cos(ph)];
     }
     buildObs(lastAction, cmd, obs);
-    mlpForward(layout, w1, b1, w2, b2, obs, hiddenBuf, act);
-    lastAction.set(act);
-    stepWithAction(act);
+    mlpForward(layout, theta, obs, bufs);
+    act.set(bufs[bufs.length - 1]);
+    // v2.3: Action-Lowpass (Profi-Trick gegen Zittern)
+    const asm = runCfg.actionSmooth;
+    if (asm < 0.999) {
+      for (let j = 0; j < act.length; j++) actF[j] = asm * act[j] + (1 - asm) * actF[j];
+    } else {
+      actF.set(act);
+    }
+    lastAction.set(actF);
+    stepWithAction(actF);
     n++;
+    // v2.3: Zufalls-Stöße (Domain-Randomization)
+    if (runCfg.pushes && ++pushTick >= 55) {
+      pushTick = 0;
+      applyPush();
+    }
     // ── Reward-Terme (identisch zur Main-Thread-Variante) ──
     const gz = projGravZ();
     const upZ = Math.max(0, Math.min(1, -gz));
@@ -344,9 +436,21 @@ function runRollout(theta, layout, reward, steps, targetPoint) {
       val += T.height.weight * (1 - Math.abs(hh - T.height.param) / Math.max(0.05, T.height.param));
     }
     if (T.forward?.enabled) {
-      val += T.forward.weight * Math.max(0, 1 - Math.abs(vx - T.forward.param) / 0.5);
+      if (tracking) {
+        const dvx = vx - cmd[0], dvy = vy - cmd[1];
+        val += T.forward.weight * Math.exp(-(dvx * dvx + dvy * dvy) / 0.25);
+      } else {
+        val += T.forward.weight * Math.max(0, 1 - Math.abs(vx - T.forward.param) / 0.5);
+      }
     }
-    if (T.lateral?.enabled) val += T.lateral.weight * Math.max(-1, Math.min(1, vy));
+    if (T.lateral?.enabled) {
+      if (tracking) {
+        const dvy = vy - cmd[1];
+        val += T.lateral.weight * Math.exp(-(dvy * dvy) / 0.25);
+      } else {
+        val += T.lateral.weight * Math.max(-1, Math.min(1, vy));
+      }
+    }
     if (T.yaw?.enabled) val += T.yaw.weight * (1 - Math.min(1, Math.abs(omega - cmd[2])));
     if (T.alive?.enabled) val += T.alive.weight;
     if (T.energy?.enabled) {
@@ -430,14 +534,18 @@ function runRollout(theta, layout, reward, steps, targetPoint) {
     }
     sum += val;
     tImit += policyDt;
-    prevAct.set(act);
+    prevAct.set(actF);
     if (isFallen()) {
       fell = true;
-      if (T.fall?.enabled) sum -= T.fall.weight * n;
+      if (T.fall?.enabled) {
+        // v2.3: Summen-Modus → flache Strafe (identisch zu es.ts)
+        sum -= runCfg.fitnessMode === "sum" ? T.fall.weight : T.fall.weight * n;
+      }
       break;
     }
   }
-  return { fitness: n > 0 ? sum / n : 0, fell, steps: n };
+  // v2.3: Fitness-Modus – Summe (Überleben zählt) oder Mittelwert (klassisch)
+  return { fitness: runCfg.fitnessMode === "sum" ? sum : (n > 0 ? sum / n : 0), fell, steps: n };
 }
 
 self.onmessage = async (e) => {
@@ -449,7 +557,10 @@ self.onmessage = async (e) => {
     } else if (msg.type === "eval") {
       const theta = new Float32Array(msg.theta);
       pointSnapshot = msg.targetPoint ? msg.targetPoint : null;
-      const r = runRollout(theta, msg.layout, msg.reward, msg.rolloutSteps, pointSnapshot);
+      const r = runRollout(
+        theta, msg.layout, msg.reward, msg.rolloutSteps, pointSnapshot,
+        msg.run ?? null, msg.cmd ?? null,
+      );
       post({ type: "result", jobId: msg.jobId, ...r });
     }
   } catch (err) {

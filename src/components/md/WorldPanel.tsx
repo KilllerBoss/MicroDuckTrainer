@@ -114,10 +114,18 @@ export default function WorldPanel({ tel, onApply, onReroll }: WorldPanelProps) 
             <Dices className="h-4 w-4" /> Neue Welt würfeln
           </Button>
         </div>
+        {/* v2.3: Original-Welt (der Simulator-Flachland-Arena) */}
+        <Button
+          variant="outline"
+          onClick={() => onApply({ ...cfg, enabled: false })}
+          className="h-11 w-full gap-1.5 border-amber-500/40 text-amber-300 hover:bg-amber-500/10"
+        >
+          <Mountain className="h-4 w-4" /> Original-Welt (flach, wie Simulator)
+        </Button>
         <p className="text-[11px] leading-snug text-slate-500">
-          Änderungen bauen die Physik neu (kurzer Ladevorgang). Der Roboter startet
-          immer in der freien Zone in der Mitte. Löcher ersetzen den Boden durch
-          Fliesen – wer reinfällt, wird als Sturz gewertet.
+          Original = Schalter AUS: flache Arena ohne Hindernisse (die Umgebung
+          des Original-MicroDuck-Simulators). Ideal zum Laufenlernen – erst
+          dort flink werden, dann Random-Welt für Robustheit.
         </p>
       </div>
 

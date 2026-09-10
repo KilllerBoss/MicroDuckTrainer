@@ -54,6 +54,7 @@ export function defaultPointCfg(modelId: ModelId | null): PointCfg {
 }
 
 // ── v2.2: Trainings-Konfiguration („Runden“ + Hyperparameter) ──
+// v2.3: + Profi-Tricks (Befehle, Curriculum, Glättung, Stöße, Fitness-Modus)
 export interface TrainCfg {
   /** Rollout-Länge in Policy-Steps (Rundenlänge). */
   rolloutSteps: number;
@@ -63,10 +64,31 @@ export interface TrainCfg {
   lr: number;
   /** Start-/Basis-Sigma (Rauschen). */
   sigma: number;
+  /** Profi-Trick: Befehle pro Runde zufällig ziehen + Belohnung fürs Folgen
+   *  (löst das „Ente steht rum“-Problem: die Policy KENNT ein Ziel-Tempo). */
+  cmdTrain: boolean;
+  /** Max-Tempo der Trainings-Befehle (m/s) – Deckel: Modell-Geschwindigkeitslimit. */
+  cmdFwd: number;
+  /** Curriculum: Tempo automatisch an Sturzrate anpassen (Profi-Trick). */
+  curriculum: boolean;
+  /** Action-Lowpass (1 = aus, 0.3 = stark geglättet) – killt Zittern. */
+  actionSmooth: number;
+  /** Zufalls-Stöße während der Runden (Domain-Randomization). */
+  pushes: boolean;
+  /** Reset mit Zustands-Rauschen (Reference-State-Init). */
+  noiseReset: boolean;
+  /** Fitness = Summe (Überleben zählt) oder Mittelwert (klassisch). */
+  fitnessMode: "sum" | "mean";
+  /** Gewichtsbremse 0–0.05 (Decay gegen saturierte tanh-Ausgänge). */
+  weightDecay: number;
 }
 
 export function defaultTrainCfg(): TrainCfg {
-  return { rolloutSteps: 200, maxGenerations: 0, lr: 0.03, sigma: 0.08 };
+  return {
+    rolloutSteps: 200, maxGenerations: 0, lr: 0.03, sigma: 0.08,
+    cmdTrain: true, cmdFwd: 0.25, curriculum: true, actionSmooth: 0.6,
+    pushes: true, noiseReset: true, fitnessMode: "sum", weightDecay: 0.02,
+  };
 }
 
 export interface Telemetry {
@@ -145,14 +167,18 @@ export class TrainerCore {
   private point: [number, number] = [0.8, 0];
   /** Momentum-Führpunkt (Modus "pfad"): folgt dem Punkt mit Feder-Dämpfer. */
   private leader: { x: number; y: number; vx: number; vy: number } | null = null;
-  private trail: [number, number][] = [];
-  private trailTick = 0;
   private markerShown = false;
   private imitClip: ImitClip | null = null;
   private imitPlaying = false;
   private imitManual = false;
   private imitTime = 0;
   private imitTargetBuf: Float32Array | null = null;
+  /** v2.3: Zentrum-Pose für Imitations-Ziele (Ente: defaultPose, G1: Standpose). */
+  private imitCenter: Float32Array | null = null;
+  /** v2.3: Höhen-Skalierung der Clip-Wurzel (Human → Roboter). */
+  private imitScaleY = 1;
+  /** v2.3: Wie lange der Joystick schon losgelassen ist (s) – Punkt fährt heim. */
+  private joyIdle = 0;
   private esObsExtra = 0; // Obs-Extra der aktuellen esView
 
   // Posen-Blending
@@ -233,7 +259,6 @@ export class TrainerCore {
       this.pointCfg = loadPointPrefs(id);
       this.point = [0.8, 0];
       this.leader = null;
-      this.trail = [];
 
       const tasks: Promise<any>[] = [this.engine.load(id, this.worldBuild)];
       if (needRig && this.world) tasks.push(mountRig(this.world, id));
@@ -278,8 +303,7 @@ export class TrainerCore {
     this.joy.y = 0;
     this.imitTime = 0;
     this.leader = null;
-    this.trail = [];
-    this.trailTick = 0;
+    this.joyIdle = 0;
   }
 
   // ── Setter (von der UI) ─────────────────────────────────────────────────────
@@ -344,13 +368,25 @@ export class TrainerCore {
     this.setReward(next);
   }
 
-  /** v2.2: Rundenlänge / Ziel-Generationen / lr / sigma. */
+  /** v2.2: Rundenlänge / Ziel-Generationen / lr / sigma. v2.3: + Profi-Tricks. */
   setTrainCfg(patch: Partial<TrainCfg>): void {
     const next: TrainCfg = { ...this.trainCfg };
+    const meta = this.modelId ? getModel(this.modelId) : null;
     if (Number.isFinite(patch.rolloutSteps)) next.rolloutSteps = clamp(Math.round(patch.rolloutSteps!), 30, 1000);
     if (Number.isFinite(patch.maxGenerations)) next.maxGenerations = clamp(Math.round(patch.maxGenerations!), 0, 100000);
     if (Number.isFinite(patch.lr)) next.lr = clamp(patch.lr!, 0.002, 0.2);
     if (Number.isFinite(patch.sigma)) next.sigma = clamp(patch.sigma!, 0.005, 0.3);
+    if (typeof patch.cmdTrain === "boolean") next.cmdTrain = patch.cmdTrain;
+    if (Number.isFinite(patch.cmdFwd)) {
+      const cap = meta ? Math.max(0.05, meta.velocityLimit.fwd) : 0.6;
+      next.cmdFwd = clamp(patch.cmdFwd!, 0.05, cap);
+    }
+    if (typeof patch.curriculum === "boolean") next.curriculum = patch.curriculum;
+    if (Number.isFinite(patch.actionSmooth)) next.actionSmooth = clamp(patch.actionSmooth!, 0.3, 1);
+    if (typeof patch.pushes === "boolean") next.pushes = patch.pushes;
+    if (typeof patch.noiseReset === "boolean") next.noiseReset = patch.noiseReset;
+    if (patch.fitnessMode === "sum" || patch.fitnessMode === "mean") next.fitnessMode = patch.fitnessMode;
+    if (Number.isFinite(patch.weightDecay)) next.weightDecay = clamp(patch.weightDecay!, 0, 0.05);
     this.trainCfg = next;
     if (this.modelId) saveTrainPrefs(this.modelId, next);
     this.applyTrainCfg();
@@ -365,6 +401,19 @@ export class TrainerCore {
     t.sigma = this.trainCfg.sigma;
     t.baseSigma = this.trainCfg.sigma;
     t.maxGenerations = this.trainCfg.maxGenerations;
+    // v2.3: Profi-Trainings-Konfiguration an den Trainer durchreichen
+    t.setRunCfg({
+      cmdTrain: this.trainCfg.cmdTrain,
+      cmdFwd: this.trainCfg.cmdFwd,
+      cmdLat: 0.15,
+      cmdAng: 0.8,
+      curriculum: this.trainCfg.curriculum,
+      actionSmooth: this.trainCfg.actionSmooth,
+      pushes: this.trainCfg.pushes,
+      noiseReset: this.trainCfg.noiseReset,
+      fitnessMode: this.trainCfg.fitnessMode,
+      weightDecay: this.trainCfg.weightDecay,
+    });
   }
 
   setJoystick(x: number, y: number) {
@@ -445,15 +494,14 @@ export class TrainerCore {
     if (this.modelId) savePointPrefs(this.modelId, next);
     if (next.mode !== prevMode) {
       this.leader = null; // Momentum neu starten
-      this.trail = [];
-      if (next.mode === "aus") this.world?.setTargetPath(null);
+      if (next.mode === "aus") this.world?.setTargetCurve(null, null);
     }
     const active = next.mode !== "aus";
     if (!active) {
       this.engine.targetPoint = null;
       this.trainer?.setTargetPoint(null);
       this.world?.setTargetPoint(0, 0, false);
-      this.world?.setTargetPath(null);
+      this.world?.setTargetCurve(null, null);
       this.markerShown = false;
     } else if (!this.engine.targetPoint) {
       this.engine.targetPoint = [...this.point] as [number, number];
@@ -490,6 +538,17 @@ export class TrainerCore {
       this.imitPlaying = true;
       this.imitTime = 0;
       this.imitTargetBuf = new Float32Array(clip.dim);
+      // v2.3: Cross-Species-Retargeting – Clip-Ziele sind RELATIV zur Ruhelage.
+      // Zentrum (Ente: defaultPose, G1: Keyframe-Standpose) addieren, sonst
+      // vergleicht der Imitations-Reward absolute Gelenkwinkel mit Offset~0
+      // und zieht den Roboter in eine nicht-standfähige Pose (→ Sturz).
+      const meta2 = getModel(modelId);
+      const centerSrc = meta2.id === "microduck"
+        ? meta2.defaultPose
+        : (this.engine.standPose.length === meta2.actionDim ? this.engine.standPose : meta2.defaultPose);
+      this.imitCenter = Float32Array.from(centerSrc);
+      // Höhen-Skalierung: Human-Wurzel (~1 m) → Roboterhöhe (Ente 0.12 m)
+      this.imitScaleY = clamp(meta2.targetHeight / Math.max(0.25, clip.baseY), 0.05, 1.2);
       this.engine.imitTarget = this.imitTargetBuf;
       this.engine.imitRootDelta = null;
       this.engine.setImitObs(true);
@@ -519,6 +578,8 @@ export class TrainerCore {
     this.imitPlaying = false;
     this.imitManual = false;
     this.imitTargetBuf = null;
+    this.imitCenter = null;
+    this.imitScaleY = 1;
     this.engine.imitTarget = null;
     this.engine.imitRootDelta = null;
     this.engine.imitPhase = null;
@@ -601,6 +662,9 @@ export class TrainerCore {
             dim: this.imitClip.dim, frames: this.imitClip.frames, fps: this.imitClip.fps,
             duration: this.imitClip.duration, targets: this.imitClip.targets,
             rootY: this.imitClip.rootY, baseY: this.imitClip.baseY,
+            // v2.3: Cross-Species-Retargeting – Zentrum-Pose + Höhen-Skalierung
+            center: this.imitCenter ? new Float32Array(this.imitCenter) : undefined,
+            scaleY: this.imitScaleY,
           }
         : null;
       const imitSig = this.imitClip
@@ -703,8 +767,8 @@ export class TrainerCore {
       const t = this.trainer;
       localStorage.setItem(this.thetaKey(), JSON.stringify({
         layout: t.layout,
-        theta: Array.from(t.theta),
-        bestTheta: Array.from(t.bestTheta),
+        thetaB64: f32ToB64(t.theta),
+        bestThetaB64: f32ToB64(t.bestTheta),
         generation: t.generation,
         bestEver: t.bestEver,
         history: t.history.slice(-200),
@@ -729,7 +793,8 @@ export class TrainerCore {
       const raw = localStorage.getItem(this.thetaKey());
       if (!raw) return false;
       const d = JSON.parse(raw) as {
-        layout: MlpLayout; theta: number[]; bestTheta: number[];
+        layout: MlpLayout; thetaB64?: string; theta?: number[];
+        bestThetaB64?: string; bestTheta?: number[];
         generation: number; bestEver: number; history: number[];
       };
       return await this.restoreTheta(d);
@@ -741,16 +806,19 @@ export class TrainerCore {
 
   /** v2.2: Theta-Daten in einen neuen Trainer übernehmen (Load + Import). */
   private async restoreTheta(d: {
-    layout: MlpLayout; theta: number[]; bestTheta?: number[];
+    layout: MlpLayout; thetaB64?: string; theta?: number[];
+    bestThetaB64?: string; bestTheta?: number[];
     generation?: number; bestEver?: number; history?: number[];
   }): Promise<boolean> {
     try {
-      if (!d?.theta?.length || !d?.layout) return false;
+      const theta = d?.thetaB64 ? b64ToF32(d.thetaB64) : (d?.theta ? new Float32Array(d.theta) : null);
+      if (!theta?.length || !d?.layout) return false;
       this.trainingActive = false;
       this.trainer?.dispose();
-      this.trainer = new EsTrainer(this.modelId!, new Float32Array(d.theta), d.layout, this.rewardCfg!);
+      this.trainer = new EsTrainer(this.modelId!, theta, d.layout, this.rewardCfg!);
       await this.trainer.init();
-      this.trainer.bestTheta = new Float32Array(d.bestTheta ?? d.theta);
+      const best = d.bestThetaB64 ? b64ToF32(d.bestThetaB64) : (d.bestTheta ? new Float32Array(d.bestTheta) : null);
+      this.trainer.bestTheta = best ?? theta.slice();
       this.trainer.generation = d.generation ?? 0;
       this.trainer.bestEver = d.bestEver ?? -Infinity;
       this.trainer.history = Array.isArray(d.history) ? d.history : [];
@@ -773,8 +841,8 @@ export class TrainerCore {
       exportVersion: 2,
       exportedAt: new Date().toISOString(),
       modelId: this.modelId,
-      theta: t ? Array.from(t.theta) : null,
-      bestTheta: t ? Array.from(t.bestTheta) : null,
+      thetaB64: t ? f32ToB64(t.theta) : null,
+      bestThetaB64: t ? f32ToB64(t.bestTheta) : null,
       layout: t ? t.layout : null,
       generation: t ? t.generation : 0,
       bestEver: t ? t.bestEver : null,
@@ -810,7 +878,7 @@ export class TrainerCore {
         parts.push("Welt");
       }
       let policyOk = false;
-      if (d.theta?.length && d.layout) {
+      if ((d.thetaB64 || d.theta?.length) && d.layout) {
         policyOk = await this.restoreTheta(d);
         if (policyOk) parts.push(`Policy (Gen ${d.generation ?? 0})`);
       }
@@ -873,12 +941,22 @@ export class TrainerCore {
       const rx = fy, ry = -fx; // rechts = (f_y, -f_x)
       const sp = 1.4 * dtStep;
       const lim = arenaHalf(this.modelId) - 0.15;
+      // v2.3: Joystick losgelassen? (Umkreis/Pfad → Punkt fährt heim)
+      const joyMag = Math.hypot(this.joy.x, this.joy.y);
+      if (joyMag > 0.02) this.joyIdle = 0; else this.joyIdle += dtStep;
       this.point[0] = clamp(this.point[0] + (this.joy.y * fx + this.joy.x * rx) * sp, -lim, lim);
       this.point[1] = clamp(this.point[1] + (this.joy.y * fy + this.joy.x * ry) * sp, -lim, lim);
 
       // Umkreis/Pfad: Punkt darf max. `radius` vom Roboter entfernt bleiben
       const p0 = engine.torsoPos();
       if (pm === "umkreis" || pm === "pfad") {
+        // v2.3: Loslassen → Punkt schwebt sanft zum Roboter zurück (weiche
+        // Feder ~3.5/s nach kurzem Delay, damit kurze Stöße nicht zappeln)
+        if (joyMag <= 0.02 && this.joyIdle > 0.15) {
+          const k = 1 - Math.exp(-dtStep * 3.5);
+          this.point[0] += (p0[0] - this.point[0]) * k;
+          this.point[1] += (p0[1] - this.point[1]) * k;
+        }
         const dxp = this.point[0] - p0[0], dyp = this.point[1] - p0[1];
         const dp = Math.hypot(dxp, dyp);
         if (dp > this.pointCfg.radius) {
@@ -903,34 +981,44 @@ export class TrainerCore {
         L.x = clamp(L.x + L.vx * dtStep, -lim, lim);
         L.y = clamp(L.y + L.vy * dtStep, -lim, lim);
         target = [L.x, L.y];
-        if (++this.trailTick >= 5) { // Trail ~10 Hz → ~9 s Historie
-          this.trailTick = 0;
-          this.trail.push([L.x, L.y]);
-          if (this.trail.length > 90) this.trail.shift();
-        }
-      } else if (this.trail.length) {
-        this.trail = [];
       }
 
       engine.targetPoint = target;
       this.trainer?.setTargetPoint(target);
       this.world?.setTargetPoint(this.point[0], this.point[1], true);
       this.markerShown = true;
-      this.world?.setTargetPath(pm === "pfad" && this.trail.length >= 2 ? this.trail : null);
+      // v2.3: Pfad als schwebende, flüssige Kurve Roboter → Punkt (Game-Stil,
+      // wie Waypoint-Anzeige) – kein Boden-Gemälde mehr.
+      if (pm === "pfad") {
+        this.world?.setTargetCurve(p0, target);
+      } else {
+        this.world?.setTargetCurve(null, null);
+      }
     } else if (engine.targetPoint || this.markerShown) {
       engine.targetPoint = null;
       this.trainer?.setTargetPoint(null);
       this.world?.setTargetPoint(0, 0, false);
-      this.world?.setTargetPath(null);
+      this.world?.setTargetCurve(null, null);
       this.markerShown = false;
     }
 
-    // ── v2.1: Imitation – Zielpose je Policy-Step ──
+    // ── v2.1: Imitation – Zielpose je Policy-Step (v2.3: mit Center+Skalierung) ──
     if (this.imitClip && this.imitPlaying && this.imitTargetBuf) {
       this.imitTime += dtStep;
       targetAt(this.imitClip, this.imitTime, this.imitTargetBuf);
+      if (this.imitCenter) {
+        for (let j = 0; j < this.imitTargetBuf.length; j++) this.imitTargetBuf[j] += this.imitCenter[j];
+      }
+      // Auf Aktuator-Range klemmen (Human-Amplituden > Gelenklimits)
+      const lims = engine.ctrlLimits;
+      if (lims) {
+        for (let j = 0; j < this.imitTargetBuf.length; j++) {
+          const lo = lims[j * 2], hi = lims[j * 2 + 1];
+          if (hi > lo) this.imitTargetBuf[j] = Math.min(hi, Math.max(lo, this.imitTargetBuf[j]));
+        }
+      }
       engine.imitTarget = this.imitTargetBuf;
-      engine.imitRootDelta = rootDeltaAt(this.imitClip, this.imitTime);
+      engine.imitRootDelta = rootDeltaAt(this.imitClip, this.imitTime) * this.imitScaleY;
       const ph = this.imitClip.duration > 0
         ? ((this.imitTime % this.imitClip.duration) / this.imitClip.duration) * 2 * Math.PI
         : 0;
@@ -1377,6 +1465,9 @@ function savePointPrefs(modelId: ModelId, cfg: PointCfg): void {
 
 function loadTrainPrefs(modelId: ModelId): TrainCfg {
   const def = defaultTrainCfg();
+  // v2.3: Modell-abhängiges Befehls-Tempo (Ente 0.25, G1 0.5)
+  const fwdCap = getModel(modelId).velocityLimit.fwd;
+  def.cmdFwd = Math.max(0.1, fwdCap * 0.8);
   try {
     const raw = localStorage.getItem(`mdt_v2_traincfg_${modelId}`);
     if (raw) {
@@ -1387,6 +1478,15 @@ function loadTrainPrefs(modelId: ModelId): TrainCfg {
           maxGenerations: Number.isFinite(p.maxGenerations) ? clamp(Math.round(p.maxGenerations!), 0, 100000) : def.maxGenerations,
           lr: Number.isFinite(p.lr) ? clamp(p.lr!, 0.002, 0.2) : def.lr,
           sigma: Number.isFinite(p.sigma) ? clamp(p.sigma!, 0.005, 0.3) : def.sigma,
+          // v2.3: Migration – fehlende Profi-Felder erhalten die AN-Defaults
+          cmdTrain: typeof p.cmdTrain === "boolean" ? p.cmdTrain : def.cmdTrain,
+          cmdFwd: Number.isFinite(p.cmdFwd) ? clamp(p.cmdFwd!, 0.05, Math.max(0.05, fwdCap)) : def.cmdFwd,
+          curriculum: typeof p.curriculum === "boolean" ? p.curriculum : def.curriculum,
+          actionSmooth: Number.isFinite(p.actionSmooth) ? clamp(p.actionSmooth!, 0.3, 1) : def.actionSmooth,
+          pushes: typeof p.pushes === "boolean" ? p.pushes : def.pushes,
+          noiseReset: typeof p.noiseReset === "boolean" ? p.noiseReset : def.noiseReset,
+          fitnessMode: p.fitnessMode === "mean" ? "mean" : def.fitnessMode,
+          weightDecay: Number.isFinite(p.weightDecay) ? clamp(p.weightDecay!, 0, 0.05) : def.weightDecay,
         };
       }
     }
@@ -1396,6 +1496,25 @@ function loadTrainPrefs(modelId: ModelId): TrainCfg {
 
 function saveTrainPrefs(modelId: ModelId, cfg: TrainCfg): void {
   try { localStorage.setItem(`mdt_v2_traincfg_${modelId}`, JSON.stringify(cfg)); } catch { /* ignore */ }
+}
+
+// ── v2.3: Float32 ⇄ Base64 (kompakte Gewichte-Speicherung) ─────────────────
+
+function f32ToB64(f: Float32Array): string {
+  const bytes = new Uint8Array(f.buffer, f.byteOffset, f.byteLength);
+  let out = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    out += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)));
+  }
+  return btoa(out);
+}
+
+function b64ToF32(b64: string): Float32Array {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Float32Array(bytes.buffer);
 }
 
 export default TrainerCore;

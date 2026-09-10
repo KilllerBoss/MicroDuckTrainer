@@ -62,7 +62,9 @@ const INITIAL_TEL: Telemetry = {
   esReady: false, speed: 0, height: 0, ctrlHz: 0, recovering: false, fallen: false,
   testUptime: 0, testReward: 0, training: false, es: null, mappings: [],
   reward: { version: 2, terms: {} },
-  trainCfg: { rolloutSteps: 200, maxGenerations: 0, lr: 0.03, sigma: 0.08 },
+  trainCfg: { rolloutSteps: 200, maxGenerations: 0, lr: 0.03, sigma: 0.08,
+    cmdTrain: true, cmdFwd: 0.25, curriculum: true, actionSmooth: 0.6,
+    pushes: true, noiseReset: true, fitnessMode: "sum", weightDecay: 0.02 },
   customCode: null,
   world: { enabled: false, seed: 0, difficulty: 0.4, density: 0.5,
     features: { treppen: true, huegel: true, loecher: false, hindernisse: true, stange: false } },
@@ -472,6 +474,27 @@ export default function TrainerApp() {
                 <Download className="h-4 w-4" /> Export
               </Button>
             </div>
+            {/* v2.3: Alles auf Original zurücksetzen (Original-Welten/-Regeln) */}
+            <Button
+              variant="outline"
+              onClick={() => {
+                try {
+                  const keys: string[] = [];
+                  for (let i = 0; i < localStorage.length; i++) {
+                    const k = localStorage.key(i);
+                    if (k && k.startsWith("mdt_v2_")) keys.push(k);
+                  }
+                  keys.forEach((k) => localStorage.removeItem(k));
+                } catch { /* ignore */ }
+                location.reload();
+              }}
+              className="h-11 w-full gap-1.5 border-amber-500/40 text-amber-300 hover:bg-amber-500/10"
+            >
+              <RotateCcw className="h-4 w-4" /> Alles auf Original zurücksetzen
+            </Button>
+            <p className="px-3 pt-1 text-[10px] leading-snug text-slate-600">
+              Setzt Welten, Regeln, Training und Steuerung auf den Auslieferungszustand zurück.
+            </p>
             <p className="px-3 pt-2 text-[10px] leading-snug text-slate-600">
               Tippe außerhalb des Menüs, um es zu schließen.
             </p>

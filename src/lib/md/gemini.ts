@@ -60,6 +60,15 @@ export interface GeminiPatch {
     sigma?: number;
     turbo?: number;
     resetFirst?: boolean;
+    // v2.3: Profi-Tricks (Gemini entscheidet mit)
+    cmdTrain?: boolean;
+    cmdFwd?: number;
+    curriculum?: boolean;
+    actionSmooth?: number;
+    pushes?: boolean;
+    noiseReset?: boolean;
+    fitnessMode?: "sum" | "mean";
+    weightDecay?: number;
   };
 }
 
@@ -126,6 +135,13 @@ ${commonContext(ctx)}
 VERFÜGBARE REWARD-TERME:
 ${TERM_DOCS}
 
+PROFI-BASIS (damit das Training wirklich lernt):
+- Bewegungsziele (gehen/springen/tanzen) brauchen Befehls-Training: training.cmdTrain=true, cmdFwd ≤ 0.25 (Ente) bzw. ≤ 0.5 (Mensch).
+- training.curriculum=true lassen (Tempo steigt automatisch, wenn die Sturzrate sinkt).
+- Gegen Zittern: training.actionSmooth≈0.6 und training.weightDecay≈0.02; für ruhige Ziele (stehen/tanzen/imitieren) actionSmooth≈0.5.
+- training.fitnessMode="sum" (Überleben zählt) und pushes/noiseReset=true für Robustheit.
+- Bei Imitation: imitate-Term hoch (2-4), forward niedrig/aus, actionSmooth 0.5.
+
 ZIEL DES NUTZERS: "${goal}"
 
 Aufgabe: Passe die Trainingsregeln an, damit der Roboter nach dem Training das Gewünschte wirklich kann.
@@ -135,7 +151,7 @@ Wenn Welt/Punkt-Modus helfen (z. B. Treppen → Welt mit Treppen, Ziel verfolgen
 turbo: 1=stabil, 16=schnell, 64=maximal (nur bei einfachen Zielen hoch setzen). resetFirst=true bei grundlegend neuem Bewegungsmuster.
 
 Antworte AUSSCHLIESSLICH mit JSON (kein Markdown) nach diesem Schema:
-{"reward":{"<termId>":{"enabled":bool,"weight":number,"param":number}},"point":{"mode":"frei","radius":1.5,"speedByDist":true,"maxSpeed":0.25,"fullDist":1.5},"world":{"enabled":bool,"difficulty":number,"density":number,"features":{"treppen":bool,"huegel":bool,"loecher":bool,"hindernisse":bool,"stange":bool}},"turbo":1,"resetFirst":bool,"explanation":"max. 4 Sätze, Deutsch, warum diese Regeln zum Ziel führen"}`;
+{"reward":{"<termId>":{"enabled":bool,"weight":number,"param":number}},"point":{"mode":"frei","radius":1.5,"speedByDist":true,"maxSpeed":0.25,"fullDist":1.5},"world":{"enabled":bool,"difficulty":number,"density":number,"features":{"treppen":bool,"huegel":bool,"loecher":bool,"hindernisse":bool,"stange":bool}},"turbo":1,"resetFirst":bool,"training":{"cmdTrain":true,"cmdFwd":0.25,"curriculum":true,"actionSmooth":0.6,"pushes":true,"noiseReset":true,"fitnessMode":"sum","weightDecay":0.02},"explanation":"max. 4 Sätze, Deutsch, warum diese Regeln zum Ziel führen"}`;
 }
 
 async function callGemini(apiKey: string, model: string, prompt: string, maxTokens: number): Promise<string> {
@@ -188,7 +204,7 @@ export async function applyGoalWithGemini(
 }
 
 function buildCodePrompt(ctx: GeminiContext, goal: string, currentCode: string | null): string {
-  return `Du bist der Trainings-Code-Autor einer Roboter-Simulation (MuJoCo + Evolution-Strategy im Browser). Du schreibst selbst JavaScript-Trainingscode und entscheidest über alles: Reward-Code, Rundenlänge (rolloutSteps), Anzahl Generationen (generations), Turbo und ob das Training bei Null starten muss.
+  return `Du bist der Trainings-Code-Autor einer Roboter-Simulation (MuJoCo + Evolution-Strategy im Browser). Du schreibst selbst JavaScript-Trainingscode und entscheidest über ALLES: Reward-Code, Rundenlänge (rolloutSteps), Anzahl Generationen (generations), Turbo, Lernrate, Sigma, Profi-Trainings-Tricks und ob das Training bei Null starten muss.
 ${commonContext(ctx)}
 ${currentCode ? `AKTUELL AKTIVER CODE (vom vorherigen Lauf, kann verbessert werden):
 
@@ -207,17 +223,27 @@ REGELN FÜR DEN CODE:
   Zum Punkt eilen:       if (!api.target) return 0; const dx = api.torso[0]-api.target[0], dy = api.torso[1]-api.target[1]; return Math.exp(-(dx*dx+dy*dy)/0.5) * 2;
   Ruhig stehen:          return api.upZ * 1.5 - Math.abs(api.vx) * 2 - Math.abs(api.omega) * 0.5;
 
+PROFI-WISSEN (wende das an, dann lernt der Roboter WIRKLICH und zittert nicht):
+- Befehls-Training (training.cmdTrain) muss AN sein, sonst hat die Policy kein Bewegungsziel und steht nur rum. cmdFwd: Ente max. 0.25 m/s, Mensch max. 0.5 m/s (mehr schafft die Physik nicht).
+- Curriculum (training.curriculum) AN lassen: startet langsam, steigert Tempo bei niedriger Sturzrate automatisch.
+- Zittern-Erkennung: Aktions-Glättung (training.actionSmooth ~0.5-0.7) + Gewichtsbremse (training.weightDecay ~0.02) aktivieren. Für ruhige Bewegungen (Stehen, Tanzen, Imitation) eher 0.5.
+- Falls-Rate im Blick: Wenn ein Ziel mit vielen Stürzen startet (Springen, Aufstehen), training.fitnessMode="sum" lassen (Überleben zählt) und rolloutSteps großzügig (300+).
+- Zufalls-Stöße (training.pushes) + Reset-Rauschen (training.noiseReset) AN = robuster. Nur bei sehr präzisen Bewegungen (Imitation feiner Choreografien) eher aus.
+- Reward-Code lieber EIN klarer Ziel-Term (2-4 Gewicht) statt vieler kleiner: z. B. Sprunghöhe mit Math.max(0, api.h - StartHöhe), Absprung mit api.vz, Landung strafen wenn |api.vz| beim Bodenkontakt groß.
+- Imitation: wenn ctx sagt "Imitation aktiv", NICHT mit zu vielen anderen Termen konkurrieren lassen; imitate-Term hoch (2-4), forward LOW oder aus, Glättung 0.5.
+
 ENTSCHEIDUNGEN (du entscheidest alles):
 - rolloutSteps: Rundenlänge in Policy-Schritten (50 = kurz, 200 = Standard, 600 = sehr lang; für Sprünge 300-400).
 - generations: Ziel-Generationen, nach denen das Training automatisch stoppt (einfach 300-800, schwer 1500-3000; 0 = unbegrenzt).
 - turbo: 1=stabil, 4, 16=schnell, 32, 64=maximal.
+- lr (0.005-0.1): klein = sauber, groß = schnell aber unruhig. sigma (0.01-0.2): Erkundungs-Rauschen.
 - resetFirst: true bei grundlegend neuem Bewegungsmuster (z. B. Gehen → Springen).
 - weight: Gewichtung des Code-Terms (1 = normal, 2-5 = dominanter, negativ = Strafe).
 
 ZIEL DES NUTZERS: "${goal}"
 
 Antworte AUSSCHLIESSLICH mit JSON (kein Markdown, Code als EIN JSON-String mit \\n-Zeilenumbrüchen):
-{"name":"kurzer deutscher Name","weight":2.0,"code":"let bonus = ...; return bonus;","training":{"rolloutSteps":300,"generations":800,"turbo":16,"lr":0.03,"sigma":0.08,"resetFirst":true},"reward":{"<termId>":{"enabled":bool,"weight":number,"param":number}},"point":{"mode":"frei"},"world":{"enabled":bool},"explanation":"max. 4 Sätze Deutsch: was dein Code belohnt und warum die Runden-Einstellungen passen"}`;
+{"name":"kurzer deutscher Name","weight":2.0,"code":"let bonus = ...; return bonus;","training":{"rolloutSteps":300,"generations":800,"turbo":16,"lr":0.03,"sigma":0.08,"resetFirst":true,"cmdTrain":true,"cmdFwd":0.25,"curriculum":true,"actionSmooth":0.6,"pushes":true,"noiseReset":true,"fitnessMode":"sum","weightDecay":0.02},"reward":{"<termId>":{"enabled":bool,"weight":number,"param":number}},"point":{"mode":"frei"},"world":{"enabled":bool},"explanation":"max. 4 Sätze Deutsch: was dein Code belohnt und warum die Runden-Einstellungen passen"}`;
 }
 
 /** Modus 2: Gemini schreibt den Trainings-Code selbst (v2.2). */
@@ -313,6 +339,15 @@ export function parsePatch(text: string): GeminiPatch {
     if (Number.isFinite(obj.training.sigma)) tr.sigma = clampNum(obj.training.sigma, 0.005, 0.3);
     if ([1, 4, 16, 32, 64].includes(obj.training.turbo)) tr.turbo = obj.training.turbo;
     if (typeof obj.training.resetFirst === "boolean") tr.resetFirst = obj.training.resetFirst;
+    // v2.3: Profi-Tricks
+    if (typeof obj.training.cmdTrain === "boolean") tr.cmdTrain = obj.training.cmdTrain;
+    if (Number.isFinite(obj.training.cmdFwd)) tr.cmdFwd = clampNum(obj.training.cmdFwd, 0.05, 0.6);
+    if (typeof obj.training.curriculum === "boolean") tr.curriculum = obj.training.curriculum;
+    if (Number.isFinite(obj.training.actionSmooth)) tr.actionSmooth = clampNum(obj.training.actionSmooth, 0.3, 1);
+    if (typeof obj.training.pushes === "boolean") tr.pushes = obj.training.pushes;
+    if (typeof obj.training.noiseReset === "boolean") tr.noiseReset = obj.training.noiseReset;
+    if (obj.training.fitnessMode === "sum" || obj.training.fitnessMode === "mean") tr.fitnessMode = obj.training.fitnessMode;
+    if (Number.isFinite(obj.training.weightDecay)) tr.weightDecay = clampNum(obj.training.weightDecay, 0, 0.05);
     if (Object.keys(tr).length) patch.training = tr;
   }
   return patch;

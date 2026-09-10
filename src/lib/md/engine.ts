@@ -78,6 +78,8 @@ export class Engine {
   cmd = new Float32Array(0);
   standPose: Float32Array = new Float32Array(0); // Gelenk-Sollwerte des Keyframes
   loadedId: ModelId | null = null;
+  /** v2.3: Befehls-Tracking aktiv (Vorwärts/Seitwärts-Term folgt cmd statt Fixwert). */
+  trackCmd = false;
 
   // ── v2.1: Welt, Punkt-Ziel, Imitation ──
   private worldKey: string | null = null;
@@ -209,6 +211,39 @@ export class Engine {
   /** Zusätzliches MjData auf demselben Modell (Main-Thread-Interleaving). */
   newData(): any {
     return new this.mujoco!.MjData(this.model);
+  }
+
+  /** v2.3: Reset mit kleinem Zustands-Rauschen (Reference-State-Init, Profi-Trick):
+   *  Gelenke ±0.03 rad, Geschwindigkeiten ±0.1 – Policies werden robust gegen
+   *  Startvariationen statt nur gegen den exakten Keyframe. */
+  addResetNoise(): void {
+    if (!this.model || !this.data) return;
+    const qpos = this.data.qpos as Float32Array;
+    const qvel = this.data.qvel as Float32Array;
+    for (let j = 0; j < this.meta.actionDim; j++) {
+      const a = this.addrs.qposAdr[j];
+      qpos[a] += gauss() * 0.03;
+      const d = this.addrs.dofAdr[j];
+      qvel[d] += gauss() * 0.1;
+    }
+    // Basis leicht variieren (nicht kippen – nur Ver Tempo/Winkelgeschwindigkeit)
+    qvel[0] += gauss() * 0.05;
+    qvel[1] += gauss() * 0.05;
+    this.mujoco!.mj_forward(this.model, this.data);
+    this.applyCtrlFromPose(this.standPose);
+    this.lastAction.fill(0);
+  }
+
+  /** v2.3: Zufalls-Stoß auf die Basis (Domain-Randomization, Profi-Trick):
+   *  lateraler Impuls + leichte Drehstörung – Robustheit gegen Schubbere. */
+  applyPush(): void {
+    if (!this.data) return;
+    const qvel = this.data.qvel as Float32Array;
+    qvel[0] += gauss() * 0.35;
+    qvel[1] += gauss() * 0.35;
+    qvel[3] += gauss() * 0.2;
+    qvel[4] += gauss() * 0.2;
+    qvel[5] += gauss() * 0.3;
   }
 
   /** Gelenklimits je Aktuator ([min,max]; [0,0] = unbegrenzt). */
@@ -426,4 +461,12 @@ export class Engine {
     this.vfs = null;
     this.loadedId = null;
   }
+}
+
+// Box–Muller für normalverteiltes Rauschen (geteilt mit es.ts)
+function gauss(): number {
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
 }

@@ -129,6 +129,15 @@ export default function GeminiPanel({ tel, onApplyPatch, onTurbo }: GeminiPanelP
             maxGenerations: tr.generations,
             lr: tr.lr,
             sigma: tr.sigma,
+            // v2.3: Profi-Tricks durchreichen
+            cmdTrain: tr.cmdTrain,
+            cmdFwd: tr.cmdFwd,
+            curriculum: tr.curriculum,
+            actionSmooth: tr.actionSmooth,
+            pushes: tr.pushes,
+            noiseReset: tr.noiseReset,
+            fitnessMode: tr.fitnessMode,
+            weightDecay: tr.weightDecay,
           }
         : undefined,
     });
@@ -435,6 +444,26 @@ export default function GeminiPanel({ tel, onApplyPatch, onTurbo }: GeminiPanelP
                 <div className="rounded border border-slate-700/60 bg-black/30 px-2 py-1.5">
                   <span className="text-slate-500">Reset zuerst: </span>
                   <span className="font-mono text-slate-300">{codeResult.patch.training.resetFirst ? "ja" : "nein"}</span>
+                </div>
+              )}
+              {codeResult.patch.training.cmdTrain !== undefined && (
+                <div className="rounded border border-slate-700/60 bg-black/30 px-2 py-1.5">
+                  <span className="text-slate-500">Befehle: </span>
+                  <span className="font-mono text-slate-300">
+                    {codeResult.patch.training.cmdTrain ? `an${codeResult.patch.training.cmdFwd !== undefined ? ` (${codeResult.patch.training.cmdFwd.toFixed(2)} m/s)` : ""}` : "aus"}
+                  </span>
+                </div>
+              )}
+              {codeResult.patch.training.actionSmooth !== undefined && (
+                <div className="rounded border border-slate-700/60 bg-black/30 px-2 py-1.5">
+                  <span className="text-slate-500">Glättung: </span>
+                  <span className="font-mono text-slate-300">{codeResult.patch.training.actionSmooth.toFixed(2)}</span>
+                </div>
+              )}
+              {codeResult.patch.training.fitnessMode !== undefined && (
+                <div className="rounded border border-slate-700/60 bg-black/30 px-2 py-1.5">
+                  <span className="text-slate-500">Fitness: </span>
+                  <span className="font-mono text-slate-300">{codeResult.patch.training.fitnessMode === "sum" ? "Überleben" : "Schnitt"}</span>
                 </div>
               )}
             </div>
